@@ -10,6 +10,11 @@ script that sends MIDI to the Deluge. **If the Deluge is unplugged (or muted),
 Claude Code runs completely normally** — every hook exits 0 with no error and
 negligible latency.
 
+> **How it's triggered: Claude Code hooks — required.** This tool does nothing on
+> its own. Claude Code calls `signal.py` from hooks it fires on session/prompt/
+> tool/subagent events, and those calls are what light the pads. Without the hooks
+> wired up (step 5 below), nothing will happen.
+
 ## What the lights mean
 
 At a glance, a pad tells you what a chat is doing:
@@ -95,17 +100,38 @@ python3 signal.py reset < /dev/null   # should blank the grid and exit cleanly
 
 ### 5. Wire up the Claude Code hooks
 
-The hooks live in **your own** Claude Code settings, not in this repo. Open
-[`settings.example.json`](settings.example.json), copy its `hooks` block into
-either:
+**This is what makes the tool run.** The hooks live in **your own** Claude Code
+settings, not in this repo. Put the block below into either:
 
 - a project's `.claude/settings.local.json` (that project only), or
-- `~/.claude/settings.json` (all projects),
+- `~/.claude/settings.json` (all projects).
 
-and **replace `/path/to/deluge-claude`** with the absolute path where you cloned
-this repo. If you already have a `hooks` block, merge these events into it.
+**Replace `/path/to/deluge-claude`** with the absolute path where you cloned this
+repo. If you already have a `hooks` block, merge these events into it. The same
+block is in [`settings.example.json`](settings.example.json) if you prefer to
+copy from a file.
+
+```json
+{
+  "hooks": {
+    "SessionStart":     [{ "hooks": [{ "type": "command", "command": "python3 /path/to/deluge-claude/signal.py session_start" }] }],
+    "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "python3 /path/to/deluge-claude/signal.py session_end" }] }],
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "python3 /path/to/deluge-claude/signal.py working" }] }],
+    "PermissionRequest":[{ "hooks": [{ "type": "command", "command": "python3 /path/to/deluge-claude/signal.py permission_request" }] }],
+    "PostToolUse":      [{ "hooks": [{ "type": "command", "command": "python3 /path/to/deluge-claude/signal.py posttool" }] }],
+    "Stop":             [{ "hooks": [{ "type": "command", "command": "python3 /path/to/deluge-claude/signal.py stop" }] }],
+    "SubagentStart":    [{ "hooks": [{ "type": "command", "command": "python3 /path/to/deluge-claude/signal.py subagent_start" }] }],
+    "SubagentStop":     [{ "hooks": [{ "type": "command", "command": "python3 /path/to/deluge-claude/signal.py subagent_stop" }] }]
+  }
+}
+```
 
 Then **restart Claude Code** so it loads the hooks.
+
+**Verify the hooks fire:** append `--debug` to any hook command (e.g.
+`... signal.py working --debug`), restart, use a chat, then check that entries
+appear in `~/.claude/hook_debug.log`. If the file stays empty, the hooks aren't
+wired into the settings Claude Code is actually reading, or it needs a restart.
 
 ---
 
