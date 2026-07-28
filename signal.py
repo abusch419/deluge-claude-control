@@ -63,6 +63,12 @@ try:
 except Exception:
     fcntl = None
 
+# Re-add the script dir at the END of sys.path (after the scrub above) so local
+# modules like `config` resolve, without re-shadowing stdlib modules.
+if _SCRIPT_DIR not in sys.path:
+    sys.path.append(_SCRIPT_DIR)
+import config  # noqa: E402  (local hardware config)
+
 CLAUDE_DIR = Path.home() / ".claude"
 STATE_FILE = CLAUDE_DIR / "deluge_slots.json"
 LOCK_FILE = CLAUDE_DIR / "deluge_slots.lock"
@@ -70,28 +76,25 @@ DEBUG_LOG = CLAUDE_DIR / "hook_debug.log"
 DISABLE_FILE = CLAUDE_DIR / "deluge_disabled"  # presence == muted (for jamming)
 BLINK_PID_DIR = CLAUDE_DIR  # blink pidfiles: deluge_blink_<note>.pid
 
-# --- Grid layout (verified empirically) -------------------------------------
-# In the Deluge Norns/Highlight grid layout, incoming notes on MIDI channel 16
-# light pads white with velocity as brightness. The main grid is 16 pads wide,
-# so consecutive notes fill a row and the next row up starts +ROW_WIDTH higher.
+# --- Grid layout -------------------------------------------------------------
+# All hardware-specific values live in config.py (edit there, or override via
+# environment variables). See that file for what each one means.
 #
 # Each chat owns a ROW (note = BASE_NOTE + row*ROW_WIDTH + col):
 #   col 0            = the chat's own status pad
 #   col 1, 2, 3, ... = that chat's subagents, left to right
-# BASE_NOTE relocates the whole block; flip direction by adjusting ROW_WIDTH sign
-# is not supported (use a different BASE_NOTE if your grid origin differs).
-BASE_NOTE = 0
-ROW_WIDTH = 16     # Deluge main grid width; next chat row starts +16
-NUM_ROWS = 8       # grid height -> up to 8 concurrent chats
-MIDI_CHANNEL = 15  # zero-indexed 15 == MIDI channel 16
+BASE_NOTE = config.BASE_NOTE
+ROW_WIDTH = config.ROW_WIDTH
+NUM_ROWS = config.NUM_ROWS
+MIDI_CHANNEL = config.MIDI_CHANNEL
 
 # Brightness / timing
-SOLID_VELOCITY = 127   # working
-IDLE_VELOCITY = 20     # chat open but idle (turn finished, waiting)
-PERM_VELOCITY = 127    # permission blink (on phase)
-FLASH_VELOCITY = 127
-FLASH_MS = 200
-BLINK_INTERVAL_S = 0.4
+SOLID_VELOCITY = config.SOLID_VELOCITY
+IDLE_VELOCITY = config.IDLE_VELOCITY
+PERM_VELOCITY = config.PERM_VELOCITY
+FLASH_VELOCITY = config.FLASH_VELOCITY
+FLASH_MS = config.FLASH_MS
+BLINK_INTERVAL_S = config.BLINK_INTERVAL_S
 
 
 # --- Mute switch -------------------------------------------------------------
@@ -291,10 +294,12 @@ def find_deluge_port():
     try:
         import mido
         names = mido.get_output_names()
-        for name in names:  # prefer "Deluge Port 1"
-            if "Deluge" in name and "1" in name:
+        if config.DELUGE_PORT_NAME in names:  # exact configured match first
+            return config.DELUGE_PORT_NAME
+        for name in names:  # fall back to any port containing the configured name
+            if config.DELUGE_PORT_NAME in name:
                 return name
-        for name in names:
+        for name in names:  # last resort: any Deluge port
             if "Deluge" in name:
                 return name
     except Exception:

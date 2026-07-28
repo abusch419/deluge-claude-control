@@ -1,5 +1,16 @@
-# Claude Code machine-local settings/overrides — not shared
+# Claude Code machine-local settings/overrides (may contain absolute paths)
 .claude/settings.local.json
+.claude/settings.json
+
+# Local environment overrides
+.env
+
+# Runtime state (lives in ~/.claude, but ignore here too just in case)
+deluge_slots.json
+deluge_slots.lock
+deluge_disabled
+hook_debug.log
+deluge_blink_*.pid
 
 # Python cruft
 __pycache__/

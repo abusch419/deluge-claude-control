@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Interactive test for driving the Synthstrom Deluge's grid LEDs by sending
-MIDI from the Mac. Requires MIDI Follow Mode + Feedback enabled on the Deluge.
+Interactive test for driving the Synthstrom Deluge's grid LEDs by sending MIDI
+from the computer. Requires Midigrid mode enabled on the Deluge (SETTINGS >
+COMMUNITY FEATURES) with an active kit clip. Port and channel come from config.py.
 
-Commands:
-  on <note> [velocity] [channel]   send note_on   (default vel 127, ch 15 = MIDI 16)
-  off <note> [channel]             send note_off  (default ch 15 = MIDI 16)
-  sweep [start] [end]              light notes one at a time, 500ms apart (default 60-67)
+Commands (defaults from config.py):
+  on <note> [velocity] [channel]   send note_on
+  off <note> [channel]             send note_off
+  sweep [start] [end]              light notes one at a time, 500ms apart
   blink <note> [count]             pulse a note on/off so it visibly blinks (default 8 pulses)
   vel <note>                       cycle note through velocities 1,32,64,96,127
   fill [velocity]                  light ALL notes 0-127 at once (find the grid mapping)
@@ -14,6 +15,8 @@ Commands:
   quit                             exit
 """
 
+import os
+import sys
 import time
 
 try:
@@ -24,12 +27,13 @@ except ImportError:
     print("    pip install mido python-rtmidi")
     raise SystemExit(1)
 
-# ---- Edit this if your Deluge output port has a different name ----
-OUTPUT_PORT_NAME = "Deluge Port 1"
-# ------------------------------------------------------------------
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+import config  # noqa: E402  (local hardware config)
 
-DEFAULT_CHANNEL = 15  # zero-indexed 15 == MIDI channel 16
-DEFAULT_VELOCITY = 127
+# Port name and channel come from config.py (edit there or use env vars).
+OUTPUT_PORT_NAME = config.DELUGE_PORT_NAME
+DEFAULT_CHANNEL = config.MIDI_CHANNEL
+DEFAULT_VELOCITY = config.SOLID_VELOCITY
 
 
 def send(port, msg_type: str, note: int, velocity: int, channel: int) -> None:
@@ -41,7 +45,7 @@ def send(port, msg_type: str, note: int, velocity: int, channel: int) -> None:
         print(f"  send failed: {e}")
 
 
-def do_sweep(port, start: int = 60, end: int = 67) -> None:
+def do_sweep(port, start: int = config.BASE_NOTE, end: int = config.BASE_NOTE + 7) -> None:
     for note in range(start, end + 1):
         send(port, "note_on", note, DEFAULT_VELOCITY, DEFAULT_CHANNEL)
         time.sleep(0.5)
@@ -146,8 +150,8 @@ def main() -> None:
                 send(port, "note_off", note, 0, channel)
 
             elif cmd == "sweep":
-                start = parse_int(parts[1], 60) if len(parts) > 1 else 60
-                end = parse_int(parts[2], 67) if len(parts) > 2 else 67
+                start = parse_int(parts[1], config.BASE_NOTE) if len(parts) > 1 else config.BASE_NOTE
+                end = parse_int(parts[2], config.BASE_NOTE + 7) if len(parts) > 2 else config.BASE_NOTE + 7
                 do_sweep(port, start, end)
 
             elif cmd == "blink":
