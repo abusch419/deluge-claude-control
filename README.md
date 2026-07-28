@@ -84,6 +84,8 @@ name). The important ones:
 - `BASE_NOTE` — the first grid pad to use.
 - `ROW_WIDTH` — grid width / row stride (16 on a standard Deluge).
 - `NUM_ROWS` — max concurrent chats.
+- `SESSION_TTL_S` — a chat's pad auto-clears after this many idle seconds
+  (default 900 = 15 min). See "Idle expiry" below.
 
 Verify it can talk to the device:
 
@@ -147,6 +149,17 @@ hook JSON payload from stdin:
 | `reset`              | manual                  | blank grid + wipe state            |
 
 Add `--debug` to append raw stdin payloads to `~/.claude/hook_debug.log`.
+
+### Idle expiry
+
+Claude Code doesn't reliably fire a "chat closed" event (closing a tab, quitting
+the app, or clicking between old chats often sends nothing), so pads would
+otherwise pile up and drift away from the chats you actually have open. To
+prevent that, each chat's pad **auto-clears after `SESSION_TTL_S` seconds of no
+activity from it** (default 15 minutes). Any hook from that chat resets its timer,
+so an active chat stays lit; reopening or using an expired chat re-lights it. A
+genuine permission blink is driven by activity, not the clock, so it keeps
+blinking until you respond.
 
 Runtime state lives in `~/.claude/` (outside this repo): `deluge_slots.json`,
 blink pidfiles, `deluge_disabled`, `hook_debug.log`.

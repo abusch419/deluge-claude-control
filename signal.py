@@ -87,6 +87,7 @@ BASE_NOTE = config.BASE_NOTE
 ROW_WIDTH = config.ROW_WIDTH
 NUM_ROWS = config.NUM_ROWS
 MIDI_CHANNEL = config.MIDI_CHANNEL
+SESSION_TTL_S = config.SESSION_TTL_S
 
 # Brightness / timing
 SOLID_VELOCITY = config.SOLID_VELOCITY
@@ -164,13 +165,16 @@ def state_lock():
 
 
 def _norm(state) -> dict:
-    """Normalize the on-disk state into {'sessions': {...}, 'agents': {...}}."""
+    """Normalize the on-disk state into {'sessions': {...}, 'agents': {...},
+    'seen': {sid: epoch_seconds}}."""
     if not isinstance(state, dict):
         state = {}
     if not isinstance(state.get("sessions"), dict):
         state["sessions"] = {}
     if not isinstance(state.get("agents"), dict):
         state["agents"] = {}
+    if not isinstance(state.get("seen"), dict):
+        state["seen"] = {}
     return state
 
 
@@ -257,20 +261,55 @@ def free_agent(aid: str):
     return note
 
 
+def _remove_session(state: dict, sid: str):
+    """Remove a chat + its subagents from `state` (unlocked). Returns notes."""
+    notes = []
+    sessions, agents = state["sessions"], state["agents"]
+    row = sessions.pop(sid, None)
+    state.get("seen", {}).pop(sid, None)
+    if row is not None:
+        notes.append(note_for(row, 0))
+        for aid in [k for k, v in agents.items() if v.get("session") == sid]:
+            a = agents.pop(aid)
+            notes.append(note_for(row, a["col"]))
+    return notes
+
+
 def free_session(sid: str):
     """Remove a chat and all its subagents. Returns list of notes to blank."""
-    notes = []
     with state_lock():
         state = _norm(load_state())
-        sessions, agents = state["sessions"], state["agents"]
-        row = sessions.pop(sid, None)
-        if row is not None:
-            notes.append(note_for(row, 0))
-            for aid in [k for k, v in agents.items() if v.get("session") == sid]:
-                a = agents.pop(aid)
-                notes.append(note_for(row, a["col"]))
+        notes = _remove_session(state, sid)
+        if notes:
             save_state(state)
     return notes
+
+
+def touch_and_prune(sid: str):
+    """Mark `sid` active now, then drop any chats idle longer than SESSION_TTL_S
+    (Claude Code doesn't reliably fire a close event, so stale rows are expired
+    on activity instead). Returns notes of expired chats to blank."""
+    expired_notes = []
+    now = time.time()
+    with state_lock():
+        state = _norm(load_state())
+        seen = state["seen"]
+        if sid:
+            seen[sid] = now
+        if SESSION_TTL_S > 0:
+            stale = []
+            for s in list(state["sessions"].keys()):
+                if s == sid:
+                    continue
+                if s not in seen:  # never timestamped: backfill, give it a full TTL
+                    seen[s] = now
+                    continue
+                if now - seen[s] > SESSION_TTL_S:
+                    stale.append(s)
+            for s in stale:
+                expired_notes.extend(_remove_session(state, s))
+        save_state(state)
+    return expired_notes
 
 
 def claim_key_note(payload: dict) -> int:
@@ -520,8 +559,23 @@ def main() -> None:
     sys.exit(0)
 
 
+# Events that represent activity from a chat (used to refresh its idle timer and
+# to trigger pruning of other chats that have gone idle past SESSION_TTL_S).
+_STATUS_EVENTS = {
+    "session_start", "working", "permission_request", "posttool",
+    "stop", "session_end", "subagent_start", "subagent_stop",
+}
+
+
 def _dispatch(event: str, payload: dict) -> None:
     sid = get_session_id(payload)
+
+    # Any activity refreshes this chat's idle timer and expires stale chats
+    # (whose close event Claude Code never delivered), blanking their pads.
+    if event in _STATUS_EVENTS:
+        for note in touch_and_prune(sid):
+            stop_blink(note)
+            send_note(note, 0)
 
     if event == "session_start":
         # A new chat opened -> claim its row; its pad shows dim (idle, waiting).

@@ -60,9 +60,15 @@ BASE_NOTE = _env_int("DELUGE_BASE_NOTE", 0)
 ROW_WIDTH = _env_int("DELUGE_ROW_WIDTH", 16)   # grid width / row stride
 NUM_ROWS = _env_int("DELUGE_NUM_ROWS", 8)      # grid height -> max concurrent chats
 
+# --- Idle expiry -------------------------------------------------------------
+# A chat's pad auto-clears after this many seconds with no hook activity from it
+# (Claude Code doesn't reliably fire a "closed" event, so stale rows would pile
+# up otherwise). Reopening or using the chat re-lights it. Default: 15 minutes.
+SESSION_TTL_S = _env_int("DELUGE_SESSION_TTL_S", 900)
+
 # --- Brightness (MIDI velocity) & timing ------------------------------------
-SOLID_VELOCITY = _env_int("DELUGE_SOLID_VELOCITY", 127)  # working
-IDLE_VELOCITY = _env_int("DELUGE_IDLE_VELOCITY", 20)     # chat open but idle
+SOLID_VELOCITY = _env_int("DELUGE_SOLID_VELOCITY", 127)  # working (bright)
+IDLE_VELOCITY = _env_int("DELUGE_IDLE_VELOCITY", 4)      # done/waiting (very dim)
 PERM_VELOCITY = _env_int("DELUGE_PERM_VELOCITY", 127)    # permission blink (on phase)
 FLASH_VELOCITY = _env_int("DELUGE_FLASH_VELOCITY", 127)  # transition flash
 FLASH_MS = _env_int("DELUGE_FLASH_MS", 200)              # flash duration
