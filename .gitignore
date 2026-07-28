@@ -1,0 +1,13 @@
+# Claude Code local settings — personal hooks, never commit
+.claude/settings.local.json
+
+# Deluge MIDI utilities — personal scripts, never commit
+signal.py
+listen_midi.py
+probe_midi.py
+midi_probe.py
+light_test.py
+
+# Python cruft
+__pycache__/
+*.pyc
