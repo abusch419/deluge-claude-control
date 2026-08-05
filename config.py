@@ -76,11 +76,12 @@ FILL_FROM_BOTTOM = _env_bool("DELUGE_FILL_FROM_BOTTOM", False)
 
 # --- Idle expiry -------------------------------------------------------------
 # A chat's pad auto-clears after this many seconds with no hook activity from it.
-# Set to 0 (the default) to NEVER auto-expire: state is held indefinitely so an
-# agent waiting for you stays visible until you deal with it or `reset`.
-# A pad that is actively BLINKING (needs intervention) is NEVER expired, even if
-# you set a positive TTL here.
-SESSION_TTL_S = _env_int("DELUGE_SESSION_TTL_S", 0)
+# This prevents dead/closed chats (Claude Code has no reliable "chat closed"
+# hook) from piling up as stale rows. Actively-working agents fire hooks
+# constantly so they never expire; a truly idle/closed chat drops after the TTL.
+# A pad that is BLINKING (needs intervention) is NEVER expired, so you never lose
+# an "agent needs you" signal. Set to 0 to disable expiry entirely.
+SESSION_TTL_S = _env_int("DELUGE_SESSION_TTL_S", 3600)  # 1 hour
 
 # --- Brightness (MIDI velocity) & timing ------------------------------------
 SOLID_VELOCITY = _env_int("DELUGE_SOLID_VELOCITY", 127)  # working (bright)
