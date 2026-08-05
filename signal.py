@@ -86,6 +86,7 @@ BLINK_PID_DIR = CLAUDE_DIR  # blink pidfiles: deluge_blink_<note>.pid
 BASE_NOTE = config.BASE_NOTE
 ROW_WIDTH = config.ROW_WIDTH
 NUM_ROWS = config.NUM_ROWS
+FILL_FROM_BOTTOM = config.FILL_FROM_BOTTOM
 MIDI_CHANNEL = config.MIDI_CHANNEL
 SESSION_TTL_S = config.SESSION_TTL_S
 
@@ -175,6 +176,8 @@ def _norm(state) -> dict:
         state["agents"] = {}
     if not isinstance(state.get("seen"), dict):
         state["seen"] = {}
+    if not isinstance(state.get("blink"), list):
+        state["blink"] = []
     return state
 
 
@@ -186,7 +189,11 @@ def _first_free(used, count: int, start: int = 0) -> int:
 
 
 def note_for(row: int, col: int) -> int:
-    return BASE_NOTE + row * ROW_WIDTH + col
+    # `row` is the logical fill index (0 = first chat). Map it to a physical grid
+    # row: with FILL_FROM_BOTTOM, index 0 lands on the bottom (highest-note block)
+    # so new chats stack upward.
+    physical = (NUM_ROWS - 1 - row) if FILL_FROM_BOTTOM else row
+    return BASE_NOTE + physical * ROW_WIDTH + col
 
 
 # --- Identity ----------------------------------------------------------------
@@ -285,10 +292,25 @@ def free_session(sid: str):
     return notes
 
 
+def _session_is_blinking(state: dict, sid: str) -> bool:
+    """True if this chat's own pad or any of its subagents' pads is blinking
+    (i.e. waiting for human intervention). Such chats must never be expired."""
+    row = state["sessions"].get(sid)
+    if row is None:
+        return False
+    if is_blinking(note_for(row, 0)):
+        return True
+    for a in state["agents"].values():
+        if a.get("session") == sid and is_blinking(note_for(row, a.get("col", 0))):
+            return True
+    return False
+
+
 def touch_and_prune(sid: str):
     """Mark `sid` active now, then drop any chats idle longer than SESSION_TTL_S
     (Claude Code doesn't reliably fire a close event, so stale rows are expired
-    on activity instead). Returns notes of expired chats to blank."""
+    on activity instead). A chat whose pad is blinking for intervention is never
+    expired. With SESSION_TTL_S == 0, nothing is expired. Returns expired notes."""
     expired_notes = []
     now = time.time()
     with state_lock():
@@ -300,6 +322,8 @@ def touch_and_prune(sid: str):
             stale = []
             for s in list(state["sessions"].keys()):
                 if s == sid:
+                    continue
+                if _session_is_blinking(state, s):  # needs intervention: never expire
                     continue
                 if s not in seen:  # never timestamped: backfill, give it a full TTL
                     seen[s] = now
@@ -383,8 +407,63 @@ def blink_pidfile(note: int) -> Path:
     return BLINK_PID_DIR / f"deluge_blink_{note}.pid"
 
 
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)  # signal 0: existence check, doesn't actually signal
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists but owned by someone else (shouldn't happen here)
+    except Exception:
+        return False
+
+
 def is_blinking(note: int) -> bool:
-    return blink_pidfile(note).exists()
+    """True only if a blink worker for `note` is genuinely running. A pidfile can
+    outlive its process (e.g. the Mac slept overnight and killed the worker); in
+    that case we clean up the stale file and report False so the pad can be
+    revived by resync_blinks() instead of being silently believed to be blinking."""
+    pf = blink_pidfile(note)
+    try:
+        if not pf.exists():
+            return False
+        pid = int(pf.read_text().strip())
+    except Exception:
+        return False
+    if _pid_alive(pid):
+        return True
+    try:
+        pf.unlink()  # stale: worker is gone
+    except Exception:
+        pass
+    return False
+
+
+def _record_blink(note: int, active: bool) -> None:
+    """Persist (or clear) the durable 'this pad needs intervention' intent in the
+    state file, so a blink survives worker death, sleep, or reboot."""
+    with state_lock():
+        state = _norm(load_state())
+        marked = set(state["blink"])
+        if active:
+            marked.add(note)
+        else:
+            marked.discard(note)
+        state["blink"] = sorted(marked)
+        save_state(state)
+
+
+def resync_blinks() -> None:
+    """Ensure every pad marked as needing intervention has a live worker.
+    Restarts any workers lost to sleep/reboot/disconnect so a 'needs
+    intervention' signal is never silently dropped."""
+    try:
+        for note in list(_norm(load_state())["blink"]):
+            if not is_blinking(note):
+                _spawn_blink_worker(note)
+    except Exception:
+        pass
 
 
 def _kill_pid(pid: int) -> None:
@@ -410,9 +489,13 @@ def _kill_pid(pid: int) -> None:
         pass
 
 
-def stop_blink(note: int, final_velocity=None) -> bool:
+def stop_blink(note: int, final_velocity=None, clear_record: bool = True) -> bool:
     """Kill a running blink worker for `note`. Returns True if one was running.
-    If final_velocity is given, set the note to that state afterwards."""
+    If final_velocity is given, set the note to that state afterwards.
+    By default also clears the durable 'needs intervention' record so it won't be
+    revived by resync_blinks (pass clear_record=False to only swap the worker)."""
+    if clear_record:
+        _record_blink(note, False)
     was_running = False
     pf = blink_pidfile(note)
     try:
@@ -434,9 +517,9 @@ def stop_blink(note: int, final_velocity=None) -> bool:
     return was_running
 
 
-def start_blink(note: int) -> None:
-    """Spawn a detached background process that pulses `note`."""
-    stop_blink(note)  # never run two blinkers on the same note
+def _spawn_blink_worker(note: int) -> None:
+    """Spawn a detached process that pulses `note`. Does NOT touch durable state;
+    used both by start_blink (first request) and resync_blinks (revival)."""
     try:
         CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
         proc = subprocess.Popen(
@@ -451,28 +534,46 @@ def start_blink(note: int) -> None:
         pass
 
 
+def start_blink(note: int) -> None:
+    """Mark `note` as needing intervention (durably) and spawn its blink worker."""
+    stop_blink(note, clear_record=False)  # never run two blinkers on the same note
+    _record_blink(note, True)             # durable intent: survives sleep/reboot
+    _spawn_blink_worker(note)
+
+
 def blink_worker(note: int) -> None:
-    """Runs in a detached process: toggle the note until SIGTERM."""
+    """Runs in a detached process: pulse `note` until SIGTERM.
+
+    Resilient by design so a "needs intervention" signal is never lost:
+      - If the Deluge isn't present yet, wait and keep retrying.
+      - If the connection drops mid-blink, reopen the port and resume (this also
+        re-lights the pad after the device is unplugged/replugged or rebooted).
+    It only ever stops when explicitly killed (stop_blink / reset).
+    """
     try:
         import mido
     except Exception:
         return
-    port_name = find_deluge_port()
-    if port_name is None:
-        return
-    try:
-        with mido.open_output(port_name) as port:
-            on = True
-            while True:
-                vel = PERM_VELOCITY if on else 0
-                try:
-                    port.send(mido.Message("note_on", channel=MIDI_CHANNEL, note=note, velocity=vel))
-                except Exception:
-                    pass
-                on = not on
-                time.sleep(BLINK_INTERVAL_S)
-    except Exception:
-        pass
+
+    on = True
+    while True:  # outer loop: (re)acquire the port forever
+        port_name = find_deluge_port()
+        if port_name is None:
+            time.sleep(1.0)  # device absent; wait and retry (don't die)
+            continue
+        try:
+            with mido.open_output(port_name) as port:
+                while True:  # inner loop: blink while the port is healthy
+                    vel = PERM_VELOCITY if on else 0
+                    try:
+                        port.send(mido.Message("note_on", channel=MIDI_CHANNEL,
+                                               note=note, velocity=vel))
+                    except Exception:
+                        break  # connection likely dropped -> reopen it
+                    on = not on
+                    time.sleep(BLINK_INTERVAL_S)
+        except Exception:
+            time.sleep(1.0)  # couldn't open (e.g. mid-reconnect); retry
 
 
 def kill_stray_workers() -> None:
@@ -567,12 +668,55 @@ _STATUS_EVENTS = {
 }
 
 
+def _refresh_grid() -> None:
+    """Redraw the whole grid from the tracked state in one MIDI pass.
+
+    Chats settle to IDLE (dim), still-tracked subagents show SOLID, every other
+    pad is blanked, and notes with a live blink worker are left untouched so a
+    pending permission request keeps pulsing.
+    """
+    try:
+        import mido
+    except Exception:
+        return
+    resync_blinks()  # revive any intervention blinks lost to sleep/reboot first
+    port_name = find_deluge_port()
+    if port_name is None:
+        return
+
+    state = _norm(load_state())
+    targets = {}
+    for sid, row in state["sessions"].items():
+        targets[note_for(row, 0)] = IDLE_VELOCITY
+    for a in state["agents"].values():
+        row = state["sessions"].get(a.get("session"))
+        if row is not None:
+            targets[note_for(row, a.get("col", 0))] = SOLID_VELOCITY
+
+    try:
+        with mido.open_output(port_name) as port:
+            for note in range(BASE_NOTE, BASE_NOTE + NUM_ROWS * ROW_WIDTH):
+                if is_blinking(note):
+                    continue  # let the blink worker own this pad
+                try:
+                    port.send(mido.Message(
+                        "note_on", channel=MIDI_CHANNEL,
+                        note=note, velocity=targets.get(note, 0)))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
 def _dispatch(event: str, payload: dict) -> None:
     sid = get_session_id(payload)
 
     # Any activity refreshes this chat's idle timer and expires stale chats
     # (whose close event Claude Code never delivered), blanking their pads.
     if event in _STATUS_EVENTS:
+        # Self-heal: if any intervention blink lost its worker (Mac slept,
+        # reboot, device unplugged), revive it so the signal isn't lost.
+        resync_blinks()
         for note in touch_and_prune(sid):
             stop_blink(note)
             send_note(note, 0)
@@ -594,11 +738,17 @@ def _dispatch(event: str, payload: dict) -> None:
         start_blink(note)
 
     elif event == "posttool":
-        # Tool finished. If that pad was blinking for a permission prompt, the
-        # prompt was resolved -> return to solid. Otherwise do nothing (cheap:
-        # no MIDI on the hot path of ordinary tool calls).
+        # A tool finished, so this chat is actively working.
         note = peek_key_note(payload)
-        if note is not None and is_blinking(note):
+        if note is None:
+            # We have no row for it yet (e.g. it was mid-work when you `reset`
+            # the grid). Re-register it now so an active chat reappears within
+            # one tool call instead of waiting for your next prompt.
+            note = claim_key_note(payload)
+            send_note(note, SOLID_VELOCITY)
+        elif is_blinking(note):
+            # Pad was blinking for a permission prompt -> prompt resolved, go
+            # back to solid. Otherwise stay cheap: no MIDI on the hot path.
             stop_blink(note, final_velocity=SOLID_VELOCITY)
 
     elif event == "stop":
@@ -646,6 +796,15 @@ def _dispatch(event: str, payload: dict) -> None:
                 DISABLE_FILE.unlink()
         except Exception:
             pass
+        # Restore the display to match tracked state (and resume any blinks that
+        # were muted for jamming) instead of waiting for the next hook event.
+        _refresh_grid()
+
+    elif event == "refresh":
+        # Re-sync the physical grid to the tracked state without wiping it:
+        # blank stray pads, redraw chats (dim/idle) and subagents (solid),
+        # and leave any active permission blinks running.
+        _refresh_grid()
 
     elif event == "reset":
         clear_all_blinks()

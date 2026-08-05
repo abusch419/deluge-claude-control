@@ -39,6 +39,13 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    val = os.environ.get(name)
+    if val in (None, ""):
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
 # --- MIDI port ---------------------------------------------------------------
 # Exact name of the Deluge's MIDI port (output + input). Run midi_probe.py to
 # see the list. The author's Deluge enumerates as "Deluge Port 1".
@@ -60,15 +67,24 @@ BASE_NOTE = _env_int("DELUGE_BASE_NOTE", 0)
 ROW_WIDTH = _env_int("DELUGE_ROW_WIDTH", 16)   # grid width / row stride
 NUM_ROWS = _env_int("DELUGE_NUM_ROWS", 8)      # grid height -> max concurrent chats
 
+# Fill order. New chats always claim the first free row and grow upward. Whether
+# the FIRST row is the physical bottom of the grid depends on your layout: some
+# Deluge kits number the bottom row with the lowest notes, others the highest.
+# When True, the first chat maps to the highest-note block so it lands on the
+# BOTTOM row and new chats fill upward. Flip this if it fills the wrong way.
+FILL_FROM_BOTTOM = _env_bool("DELUGE_FILL_FROM_BOTTOM", False)
+
 # --- Idle expiry -------------------------------------------------------------
-# A chat's pad auto-clears after this many seconds with no hook activity from it
-# (Claude Code doesn't reliably fire a "closed" event, so stale rows would pile
-# up otherwise). Reopening or using the chat re-lights it. Default: 15 minutes.
-SESSION_TTL_S = _env_int("DELUGE_SESSION_TTL_S", 900)
+# A chat's pad auto-clears after this many seconds with no hook activity from it.
+# Set to 0 (the default) to NEVER auto-expire: state is held indefinitely so an
+# agent waiting for you stays visible until you deal with it or `reset`.
+# A pad that is actively BLINKING (needs intervention) is NEVER expired, even if
+# you set a positive TTL here.
+SESSION_TTL_S = _env_int("DELUGE_SESSION_TTL_S", 0)
 
 # --- Brightness (MIDI velocity) & timing ------------------------------------
 SOLID_VELOCITY = _env_int("DELUGE_SOLID_VELOCITY", 127)  # working (bright)
-IDLE_VELOCITY = _env_int("DELUGE_IDLE_VELOCITY", 4)      # done/waiting (very dim)
+IDLE_VELOCITY = _env_int("DELUGE_IDLE_VELOCITY", 25)     # done/waiting (dim but visible)
 PERM_VELOCITY = _env_int("DELUGE_PERM_VELOCITY", 127)    # permission blink (on phase)
 FLASH_VELOCITY = _env_int("DELUGE_FLASH_VELOCITY", 127)  # transition flash
 FLASH_MS = _env_int("DELUGE_FLASH_MS", 200)              # flash duration
