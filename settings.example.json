@@ -1,12 +1,12 @@
 {
-  "_comment": "Claude Code hooks for the Deluge status display. Copy the 'hooks' block into your OWN .claude/settings.local.json (project-level) or ~/.claude/settings.json (global). Replace /path/to/deluge-claude with the absolute path where you cloned this repo. If you already have a 'hooks' block, merge these events into it. Restart Claude Code afterward so it loads the hooks.",
+  "_comment": "Claude Code hooks for the Deluge status display. Copy the 'hooks' block into your OWN .claude/settings.local.json (project-level) or ~/.claude/settings.json (global). Replace /path/to/deluge-claude with the absolute path where you cloned this repo. IMPORTANT: create the dedicated venv first (see README step 1) and keep the .venv/bin/python3 interpreter path below — bare 'python3' may lack mido in Claude Code's hook shell and silently fail. If you already have a 'hooks' block, merge these events into it. Restart Claude Code afterward so it loads the hooks.",
   "hooks": {
     "SessionStart": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "python3 /path/to/deluge-claude/signal.py session_start"
+            "command": "/path/to/deluge-claude/.venv/bin/python3 /path/to/deluge-claude/signal.py session_start"
           }
         ]
       }
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 /path/to/deluge-claude/signal.py session_end"
+            "command": "/path/to/deluge-claude/.venv/bin/python3 /path/to/deluge-claude/signal.py session_end"
           }
         ]
       }
@@ -26,7 +26,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 /path/to/deluge-claude/signal.py working"
+            "command": "/path/to/deluge-claude/.venv/bin/python3 /path/to/deluge-claude/signal.py working"
           }
         ]
       }
@@ -36,7 +36,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 /path/to/deluge-claude/signal.py permission_request"
+            "command": "/path/to/deluge-claude/.venv/bin/python3 /path/to/deluge-claude/signal.py permission_request"
           }
         ]
       }
@@ -46,7 +46,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 /path/to/deluge-claude/signal.py posttool"
+            "command": "/path/to/deluge-claude/.venv/bin/python3 /path/to/deluge-claude/signal.py posttool"
           }
         ]
       }
@@ -56,7 +56,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 /path/to/deluge-claude/signal.py stop"
+            "command": "/path/to/deluge-claude/.venv/bin/python3 /path/to/deluge-claude/signal.py stop"
           }
         ]
       }
@@ -66,7 +66,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 /path/to/deluge-claude/signal.py subagent_start"
+            "command": "/path/to/deluge-claude/.venv/bin/python3 /path/to/deluge-claude/signal.py subagent_start"
           }
         ]
       }
@@ -76,7 +76,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 /path/to/deluge-claude/signal.py subagent_stop"
+            "command": "/path/to/deluge-claude/.venv/bin/python3 /path/to/deluge-claude/signal.py subagent_stop"
           }
         ]
       }

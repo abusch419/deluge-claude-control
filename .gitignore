@@ -15,3 +15,6 @@ deluge_blink_*.pid
 # Python cruft
 __pycache__/
 *.pyc
+
+# Local virtualenv (created per-machine; see README)
+.venv/

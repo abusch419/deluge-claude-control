@@ -31,6 +31,8 @@ Events (first CLI arg):
   disable             mute (for jamming): blank grid; all hooks no-op until enable
   enable              unmute; hooks resume lighting pads
   reset               blank the whole grid + wipe state
+  refresh             re-sync the grid to tracked state (non-destructive)
+  watch               run the self-healing daemon that keeps the grid in sync
   _blink <note>       (internal) background blink worker
 
 While disabled (a flag file exists), every hook exits immediately without
@@ -97,6 +99,8 @@ PERM_VELOCITY = config.PERM_VELOCITY
 FLASH_VELOCITY = config.FLASH_VELOCITY
 FLASH_MS = config.FLASH_MS
 BLINK_INTERVAL_S = config.BLINK_INTERVAL_S
+WATCH_INTERVAL_S = config.WATCH_INTERVAL_S
+WATCH_FULL_REPAINT_S = config.WATCH_FULL_REPAINT_S
 
 
 # --- Mute switch -------------------------------------------------------------
@@ -646,6 +650,14 @@ def main() -> None:
             pass
         sys.exit(0)
 
+    # Long-running watch daemon: continuously reconciles the grid with state.
+    if len(sys.argv) >= 2 and sys.argv[1] == "watch":
+        try:
+            watch_loop()
+        except KeyboardInterrupt:
+            pass
+        sys.exit(0)
+
     parser = argparse.ArgumentParser()
     parser.add_argument("event")
     parser.add_argument("--debug", action="store_true")
@@ -724,6 +736,71 @@ def _refresh_grid() -> None:
                     pass
     except Exception:
         pass
+
+
+def _desired_grid(state: dict) -> dict:
+    """Target velocity for every steady (non-blink) pad, derived purely from
+    tracked state: a chat is SOLID while working, IDLE (dim) once it has finished
+    a turn, and each live subagent pad is SOLID. Notes not present are off (0)."""
+    desired = {}
+    sessions = state["sessions"]
+    idle = state["idle_since"]
+    for sid, row in sessions.items():
+        desired[note_for(row, 0)] = IDLE_VELOCITY if sid in idle else SOLID_VELOCITY
+    for a in state["agents"].values():
+        row = sessions.get(a.get("session"))
+        if row is not None:
+            desired[note_for(row, a.get("col", 0))] = SOLID_VELOCITY
+    return desired
+
+
+def watch_loop() -> None:
+    """Continuously reconcile the Deluge grid with tracked state.
+
+    This is the reliability backbone: instead of only painting when a hook fires,
+    the watcher repaints from state every WATCH_INTERVAL_S, so the display always
+    reflects reality and SELF-HEALS after a Deluge unplug/power-cycle or a Mac
+    sleep. It diff-paints (only sends changed pads) to stay quiet, forces a full
+    repaint periodically, blanks the grid while muted, and leaves actively
+    blinking pads to their blink workers.
+    """
+    try:
+        import mido
+    except Exception:
+        return
+    grid = list(range(BASE_NOTE, BASE_NOTE + NUM_ROWS * ROW_WIDTH))
+    while True:  # outer loop: (re)acquire the port forever
+        port_name = find_deluge_port()
+        if port_name is None:
+            time.sleep(2.0)
+            continue
+        painted = {}            # note -> last velocity we sent (reset on reconnect)
+        last_full = 0.0         # force an initial full paint
+        try:
+            with mido.open_output(port_name) as out:
+                while True:
+                    now = time.time()
+                    if now - last_full > WATCH_FULL_REPAINT_S:
+                        painted.clear()  # heal any silent drift
+                        last_full = now
+
+                    if is_disabled():   # muted for jamming: keep the grid dark
+                        desired = {}
+                    else:
+                        desired = _desired_grid(_norm(load_state()))
+
+                    for n in grid:
+                        if not is_disabled() and is_blinking(n):
+                            painted.pop(n, None)  # blink worker owns it; repaint later
+                            continue
+                        vel = desired.get(n, 0)
+                        if painted.get(n) != vel:
+                            out.send(mido.Message("note_on", channel=MIDI_CHANNEL,
+                                                  note=n, velocity=vel))
+                            painted[n] = vel
+                    time.sleep(WATCH_INTERVAL_S)
+        except Exception:
+            time.sleep(2.0)  # port lost (unplug/power-cycle) -> reconnect + full repaint
 
 
 def _dispatch(event: str, payload: dict) -> None:

@@ -91,3 +91,12 @@ PERM_VELOCITY = _env_int("DELUGE_PERM_VELOCITY", 127)    # permission blink (on 
 FLASH_VELOCITY = _env_int("DELUGE_FLASH_VELOCITY", 127)  # transition flash
 FLASH_MS = _env_int("DELUGE_FLASH_MS", 200)              # flash duration
 BLINK_INTERVAL_S = _env_float("DELUGE_BLINK_INTERVAL_S", 0.4)  # permission blink rate
+
+# --- Watch daemon ------------------------------------------------------------
+# The `watch` service continuously repaints the grid from tracked state so the
+# display always matches reality and self-heals after a Deluge unplug/power-cycle
+# or a Mac sleep. This is how often it reconciles (seconds).
+WATCH_INTERVAL_S = _env_float("DELUGE_WATCH_INTERVAL_S", 1.0)
+# Every this many seconds the watcher forces a full repaint (belt-and-suspenders
+# in case the device silently forgot its LEDs without dropping the USB port).
+WATCH_FULL_REPAINT_S = _env_float("DELUGE_WATCH_FULL_REPAINT_S", 20.0)

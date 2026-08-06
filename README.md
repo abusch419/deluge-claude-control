@@ -43,13 +43,23 @@ row. Each **subagent** the chat spawns lights the next pad to the right.
 
 ### 1. Install dependencies
 
-Requires Python 3.
+Requires Python 3. **Use a dedicated virtualenv** and reference it by absolute
+path everywhere (hooks + service). This is important: Claude Code runs hooks in a
+non-interactive shell where bare `python3` may resolve to a Python that does
+**not** have `mido` installed — in which case every MIDI send silently fails and
+nothing lights up. A pinned venv path avoids that entirely.
 
 ```bash
-pip3 install mido python-rtmidi
-# on a system-managed Python you may need:
-# pip3 install mido python-rtmidi --break-system-packages
+cd /path/to/deluge-claude
+python3 -m venv .venv
+./.venv/bin/python3 -m pip install --upgrade pip
+./.venv/bin/python3 -m pip install mido python-rtmidi
+# verify:
+./.venv/bin/python3 -c "import mido, rtmidi; print('ok', mido.get_output_names())"
 ```
+
+Use `/path/to/deluge-claude/.venv/bin/python3` as the interpreter in the hooks
+(step 5) and the watch service (step 6).
 
 ### 2. Configure the Deluge (on the device)
 
@@ -89,8 +99,12 @@ name). The important ones:
 - `BASE_NOTE` — the first grid pad to use.
 - `ROW_WIDTH` — grid width / row stride (16 on a standard Deluge).
 - `NUM_ROWS` — max concurrent chats.
-- `SESSION_TTL_S` — a chat's pad auto-clears after this many idle seconds
-  (default 900 = 15 min). See "Idle expiry" below.
+- `SESSION_TTL_S` — a chat's pad auto-clears once it has **finished a turn and
+  then stayed idle** this many seconds (default 7200 = 2h; `0` disables it). See
+  "Idle expiry" below.
+- `IDLE_VELOCITY` — brightness of a finished/idle pad (default 25; keep it well
+  below `SOLID_VELOCITY` so working vs. idle is obvious, but high enough to see).
+- `WATCH_INTERVAL_S` — how often the watch service reconciles the grid.
 
 Verify it can talk to the device:
 
@@ -111,22 +125,49 @@ repo. If you already have a `hooks` block, merge these events into it. The same
 block is in [`settings.example.json`](settings.example.json) if you prefer to
 copy from a file.
 
+Use the **absolute venv Python path** (from step 1) as the interpreter, not bare
+`python3` (see the warning in step 1).
+
 ```json
 {
   "hooks": {
-    "SessionStart":     [{ "hooks": [{ "type": "command", "command": "python3 /path/to/deluge-claude/signal.py session_start" }] }],
-    "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "python3 /path/to/deluge-claude/signal.py session_end" }] }],
-    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "python3 /path/to/deluge-claude/signal.py working" }] }],
-    "PermissionRequest":[{ "hooks": [{ "type": "command", "command": "python3 /path/to/deluge-claude/signal.py permission_request" }] }],
-    "PostToolUse":      [{ "hooks": [{ "type": "command", "command": "python3 /path/to/deluge-claude/signal.py posttool" }] }],
-    "Stop":             [{ "hooks": [{ "type": "command", "command": "python3 /path/to/deluge-claude/signal.py stop" }] }],
-    "SubagentStart":    [{ "hooks": [{ "type": "command", "command": "python3 /path/to/deluge-claude/signal.py subagent_start" }] }],
-    "SubagentStop":     [{ "hooks": [{ "type": "command", "command": "python3 /path/to/deluge-claude/signal.py subagent_stop" }] }]
+    "SessionStart":     [{ "hooks": [{ "type": "command", "command": "/path/to/deluge-claude/.venv/bin/python3 /path/to/deluge-claude/signal.py session_start" }] }],
+    "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "/path/to/deluge-claude/.venv/bin/python3 /path/to/deluge-claude/signal.py session_end" }] }],
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "/path/to/deluge-claude/.venv/bin/python3 /path/to/deluge-claude/signal.py working" }] }],
+    "PermissionRequest":[{ "hooks": [{ "type": "command", "command": "/path/to/deluge-claude/.venv/bin/python3 /path/to/deluge-claude/signal.py permission_request" }] }],
+    "PostToolUse":      [{ "hooks": [{ "type": "command", "command": "/path/to/deluge-claude/.venv/bin/python3 /path/to/deluge-claude/signal.py posttool" }] }],
+    "Stop":             [{ "hooks": [{ "type": "command", "command": "/path/to/deluge-claude/.venv/bin/python3 /path/to/deluge-claude/signal.py stop" }] }],
+    "SubagentStart":    [{ "hooks": [{ "type": "command", "command": "/path/to/deluge-claude/.venv/bin/python3 /path/to/deluge-claude/signal.py subagent_start" }] }],
+    "SubagentStop":     [{ "hooks": [{ "type": "command", "command": "/path/to/deluge-claude/.venv/bin/python3 /path/to/deluge-claude/signal.py subagent_stop" }] }]
   }
 }
 ```
 
 Then **restart Claude Code** so it loads the hooks.
+
+### 6. Run the watch service (keeps the grid in sync)
+
+Hooks only paint a pad at the instant they fire, so after a Deluge power-cycle,
+unplug, or a Mac sleep the grid would drift out of sync. The **watch daemon**
+fixes this: it continuously repaints the grid from tracked state (every second)
+and self-heals whenever the device reconnects.
+
+Run it once to try it:
+
+```bash
+/path/to/deluge-claude/.venv/bin/python3 /path/to/deluge-claude/signal.py watch
+```
+
+To have it always running (auto-start at login, restart if it dies), install the
+launchd agent. Copy [`com.deluge-claude.watch.plist.example`](com.deluge-claude.watch.plist.example)
+to `~/Library/LaunchAgents/com.deluge-claude.watch.plist`, replace the paths
+inside, then:
+
+```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.deluge-claude.watch.plist
+launchctl enable   gui/$(id -u)/com.deluge-claude.watch
+# check it: launchctl print gui/$(id -u)/com.deluge-claude.watch | grep state
+```
 
 **Verify the hooks fire:** append `--debug` to any hook command (e.g.
 `... signal.py working --debug`), restart, use a chat, then check that entries
@@ -173,19 +214,21 @@ hook JSON payload from stdin:
 | `subagent_stop`      | subagent finished       | flash, then off; free that pad     |
 | `disable` / `enable` | manual                  | mute / unmute                      |
 | `reset`              | manual                  | blank grid + wipe state            |
+| `refresh`            | manual                  | re-sync grid to state (no wipe)    |
+| `watch`              | service                 | continuously reconcile the grid    |
 
 Add `--debug` to append raw stdin payloads to `~/.claude/hook_debug.log`.
 
 ### Idle expiry
 
-Claude Code doesn't reliably fire a "chat closed" event (closing a tab, quitting
-the app, or clicking between old chats often sends nothing), so pads would
-otherwise pile up and drift away from the chats you actually have open. To
-prevent that, each chat's pad **auto-clears after `SESSION_TTL_S` seconds of no
-activity from it** (default 15 minutes). Any hook from that chat resets its timer,
-so an active chat stays lit; reopening or using an expired chat re-lights it. A
-genuine permission blink is driven by activity, not the clock, so it keeps
-blinking until you respond.
+Claude Code doesn't reliably fire a "chat closed" event — in particular, the VS
+Code extension does **not** fire `SessionEnd` when you close a tab. So pads would
+otherwise pile up and drift from the chats you actually have open. To prevent
+that, a chat's pad **auto-clears once it has finished a turn (`Stop`) and then
+stayed idle for `SESSION_TTL_S` seconds** (default 2h). A chat that is actively
+working has no idle clock and is **never** expired, no matter how long it runs;
+a blinking (needs-you) pad is never expired either. Set `SESSION_TTL_S=0` to
+disable expiry entirely and only clear via a manual `reset`.
 
 Runtime state lives in `~/.claude/` (outside this repo): `deluge_slots.json`,
 blink pidfiles, `deluge_disabled`, `hook_debug.log`.
@@ -196,9 +239,10 @@ blink pidfiles, `deluge_disabled`, `hook_debug.log`.
 
 | File                    | Purpose |
 | ----------------------- | ------- |
-| `signal.py`             | the hook script — the whole status display |
+| `signal.py`             | the hook script + watch daemon — the whole status display |
 | `config.py`             | hardware config (port, channel, notes, timing) |
 | `settings.example.json` | hooks block to copy into your Claude Code settings |
+| `com.deluge-claude.watch.plist.example` | launchd agent for the auto-start watch service |
 | `midi_probe.py`         | list MIDI inputs and see what notes your pads send |
 | `light_test.py`         | send notes to the Deluge to find which pads light |
 
