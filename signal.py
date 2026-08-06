@@ -178,6 +178,8 @@ def _norm(state) -> dict:
         state["seen"] = {}
     if not isinstance(state.get("blink"), list):
         state["blink"] = []
+    if not isinstance(state.get("idle_since"), dict):
+        state["idle_since"] = {}
     return state
 
 
@@ -274,6 +276,7 @@ def _remove_session(state: dict, sid: str):
     sessions, agents = state["sessions"], state["agents"]
     row = sessions.pop(sid, None)
     state.get("seen", {}).pop(sid, None)
+    state.get("idle_since", {}).pop(sid, None)
     if row is not None:
         notes.append(note_for(row, 0))
         for aid in [k for k, v in agents.items() if v.get("session") == sid]:
@@ -306,18 +309,33 @@ def _session_is_blinking(state: dict, sid: str) -> bool:
     return False
 
 
-def touch_and_prune(sid: str):
-    """Mark `sid` active now, then drop any chats idle longer than SESSION_TTL_S
-    (Claude Code doesn't reliably fire a close event, so stale rows are expired
-    on activity instead). A chat whose pad is blinking for intervention is never
-    expired. With SESSION_TTL_S == 0, nothing is expired. Returns expired notes."""
+# Events after which a chat is considered "finished / idle" (eligible to expire
+# once it stays quiet), vs. events that mean it's actively working (never expire).
+_IDLE_EVENTS = {"session_start", "stop"}
+_ACTIVE_EVENTS = {"working", "permission_request", "posttool", "subagent_start"}
+
+
+def touch_and_prune(sid: str, event: str):
+    """Update `sid`'s idle/active bookkeeping for this event, then expire any OTHER
+    chat that FINISHED a turn and then stayed idle longer than SESSION_TTL_S.
+
+    The VS Code extension never fires SessionEnd on tab close, so we approximate
+    "closed" as "finished and then abandoned". A chat that is actively working
+    (its last event was a prompt/tool use, so it has no idle timestamp) is never
+    expired, and a blinking pad (needs intervention) is never expired. With
+    SESSION_TTL_S == 0, nothing is expired. Returns notes to blank."""
     expired_notes = []
     now = time.time()
     with state_lock():
         state = _norm(load_state())
         seen = state["seen"]
+        idle_since = state["idle_since"]
         if sid:
             seen[sid] = now
+            if event in _IDLE_EVENTS:
+                idle_since[sid] = now          # finished/waiting -> start idle clock
+            elif event in _ACTIVE_EVENTS:
+                idle_since.pop(sid, None)       # actively working -> not expirable
         if SESSION_TTL_S > 0:
             stale = []
             for s in list(state["sessions"].keys()):
@@ -325,10 +343,10 @@ def touch_and_prune(sid: str):
                     continue
                 if _session_is_blinking(state, s):  # needs intervention: never expire
                     continue
-                if s not in seen:  # never timestamped: backfill, give it a full TTL
-                    seen[s] = now
+                ts = idle_since.get(s)
+                if ts is None:  # never finished a turn (still working): keep
                     continue
-                if now - seen[s] > SESSION_TTL_S:
+                if now - ts > SESSION_TTL_S:
                     stale.append(s)
             for s in stale:
                 expired_notes.extend(_remove_session(state, s))
@@ -717,7 +735,7 @@ def _dispatch(event: str, payload: dict) -> None:
         # Self-heal: if any intervention blink lost its worker (Mac slept,
         # reboot, device unplugged), revive it so the signal isn't lost.
         resync_blinks()
-        for note in touch_and_prune(sid):
+        for note in touch_and_prune(sid, event):
             stop_blink(note)
             send_note(note, 0)
 

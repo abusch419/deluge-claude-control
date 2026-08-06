@@ -75,12 +75,14 @@ NUM_ROWS = _env_int("DELUGE_NUM_ROWS", 8)      # grid height -> max concurrent c
 FILL_FROM_BOTTOM = _env_bool("DELUGE_FILL_FROM_BOTTOM", False)
 
 # --- Idle expiry -------------------------------------------------------------
-# A chat's pad auto-clears after this many seconds with no hook activity from it.
-# Default 0 = NEVER auto-expire: rows are held until you manually `reset`. This is
-# the simple, predictable behavior (no rows vanishing on their own). Set a
-# positive value (e.g. 3600) if you'd rather have idle chats clear themselves;
-# working agents fire hooks constantly and blinking pads are always exempt.
-SESSION_TTL_S = _env_int("DELUGE_SESSION_TTL_S", 0)
+# How a finished chat's pad auto-clears. The VS Code Claude Code extension does
+# NOT fire SessionEnd when you close a tab, so a closed chat can't be detected
+# directly. Instead, a chat is cleared only once it has FINISHED a turn (Stop)
+# and then stayed idle this many seconds. A chat that is actively working (its
+# last event was a prompt/tool use) is NEVER expired, no matter how long it runs,
+# and a BLINKING pad (needs you) is never expired either. Set to 0 to disable
+# auto-expiry entirely and only clear via a manual `reset`.
+SESSION_TTL_S = _env_int("DELUGE_SESSION_TTL_S", 7200)  # 2 hours idle after finishing
 
 # --- Brightness (MIDI velocity) & timing ------------------------------------
 SOLID_VELOCITY = _env_int("DELUGE_SOLID_VELOCITY", 127)  # working (bright)
