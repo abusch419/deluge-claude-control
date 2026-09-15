@@ -19,12 +19,22 @@ negligible latency.
 
 At a glance, a pad tells you what a chat is doing:
 
-| Pad appearance | Meaning |
-| -------------- | ------- |
-| **Blinking**   | needs your input (permission request) |
-| **Bright**     | working |
-| **Dim**        | idle (turn finished, chat still open) |
-| **Off**        | done / chat closed |
+| Pad appearance             | Meaning |
+| -------------------------- | ------- |
+| **Bright, fast blink**     | needs your approval (permission request) |
+| **Bright, slow blink**     | working |
+| **Dull, steady**           | stopped (turn finished, chat still open) |
+| **Off**                    | done / chat closed |
+
+The grid is white-only, so brightness and blink rate carry the state instead of
+colour. The two blink rates are ~5x apart (0.18s vs 0.9s half-period), which is
+what makes "needs you" unmistakable next to an ordinary working pad; and a
+working pad never dims below the dull level, so it can't be misread as stopped
+mid-blink.
+
+> The blinking is driven by the **watch daemon** (step 6), which repaints the
+> grid many times a second. Hooks alone still light pads bright or dull, but
+> without the daemon running nothing blinks.
 
 Layout (the Deluge main grid is 16 pads wide):
 
@@ -102,8 +112,15 @@ name). The important ones:
 - `SESSION_TTL_S` — a chat's pad auto-clears once it has **finished a turn and
   then stayed idle** this many seconds (default 7200 = 2h; `0` disables it). See
   "Idle expiry" below.
-- `IDLE_VELOCITY` — brightness of a finished/idle pad (default 25; keep it well
-  below `SOLID_VELOCITY` so working vs. idle is obvious, but high enough to see).
+- `IDLE_VELOCITY` — brightness of a stopped/idle pad (default 25). This is the
+  floor of the whole language, so keep it clearly visible but well below
+  `WORK_LOW_VELOCITY`.
+- `SOLID_VELOCITY` / `WORK_LOW_VELOCITY` — the two levels a working pad blinks
+  between (default 127 / 60).
+- `PERM_VELOCITY` / `PERM_LOW_VELOCITY` — the two levels a needs-approval pad
+  blinks between (default 127 / 0, so it drops fully off).
+- `WORK_BLINK_S` / `PERM_BLINK_S` — blink half-periods in seconds (default 0.9
+  and 0.18). Keep them far apart or the two states stop being distinguishable.
 - `WATCH_INTERVAL_S` — how often the watch service reconciles the grid.
 
 Verify it can talk to the device:
@@ -149,8 +166,10 @@ Then **restart Claude Code** so it loads the hooks.
 
 Hooks only paint a pad at the instant they fire, so after a Deluge power-cycle,
 unplug, or a Mac sleep the grid would drift out of sync. The **watch daemon**
-fixes this: it continuously repaints the grid from tracked state (every second)
-and self-heals whenever the device reconnects.
+fixes this: it continuously repaints the grid from tracked state and self-heals
+whenever the device reconnects. It is also what animates the blinks — each pad's
+brightness is a function of its state and the clock, so the daemon has to be
+running for working and needs-approval pads to pulse.
 
 Run it once to try it:
 
@@ -205,13 +224,13 @@ hook JSON payload from stdin:
 | Event                | Fires when              | Effect                             |
 | -------------------- | ----------------------- | ---------------------------------- |
 | `session_start`      | chat opened             | claim a row; pad dim (idle)        |
-| `working`            | prompt submitted        | chat's pad solid                   |
-| `permission_request` | Claude needs permission | blink that pad                     |
-| `posttool`           | a tool finished         | clear a pending blink → solid      |
-| `stop`               | chat finished a turn    | flash, then dim (idle); keeps row  |
+| `working`            | prompt submitted        | chat's pad slow-blinks (working)   |
+| `permission_request` | Claude needs permission | that pad fast-blinks               |
+| `posttool`           | a tool finished         | approval cleared → back to working |
+| `stop`               | chat finished a turn    | steady dull (stopped); keeps row   |
 | `session_end`        | chat closed             | free the row + its subagents, off  |
-| `subagent_start`     | subagent spawned        | next pad in its chat's row, solid  |
-| `subagent_stop`      | subagent finished       | flash, then off; free that pad     |
+| `subagent_start`     | subagent spawned        | next pad in its chat's row, working |
+| `subagent_stop`      | subagent finished       | pad off; free that pad             |
 | `disable` / `enable` | manual                  | mute / unmute                      |
 | `reset`              | manual                  | blank grid + wipe state            |
 | `refresh`            | manual                  | re-sync grid to state (no wipe)    |
@@ -227,11 +246,11 @@ otherwise pile up and drift from the chats you actually have open. To prevent
 that, a chat's pad **auto-clears once it has finished a turn (`Stop`) and then
 stayed idle for `SESSION_TTL_S` seconds** (default 2h). A chat that is actively
 working has no idle clock and is **never** expired, no matter how long it runs;
-a blinking (needs-you) pad is never expired either. Set `SESSION_TTL_S=0` to
+a pad waiting on your approval is never expired either. Set `SESSION_TTL_S=0` to
 disable expiry entirely and only clear via a manual `reset`.
 
 Runtime state lives in `~/.claude/` (outside this repo): `deluge_slots.json`,
-blink pidfiles, `deluge_disabled`, `hook_debug.log`.
+`deluge_disabled`, `hook_debug.log`.
 
 ---
 
@@ -253,6 +272,10 @@ blink pidfiles, `deluge_disabled`, `hook_debug.log`.
 - **Permission prompts can't be attributed to a specific subagent** — Claude
   Code's permission events don't carry an agent id, so a blink lands on the main
   chat's pad.
-- Colors are white only; brightness + blink convey state (Midigrid limitation).
+- Colors are white only, and that's a firmware limit, not a choice here: the
+  community firmware's Norns/Midigrid layout renders every incoming note as
+  `colours::white_full.adjust(velocity, 1)`, and there's no SysEx command for pad
+  LEDs. Brightness + blink rate are the only channels available without forking
+  the firmware.
 - Requires the Deluge community firmware with Midigrid; stock firmware won't
   light pads from incoming MIDI.

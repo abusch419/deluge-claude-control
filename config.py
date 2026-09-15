@@ -84,19 +84,40 @@ FILL_FROM_BOTTOM = _env_bool("DELUGE_FILL_FROM_BOTTOM", False)
 # auto-expiry entirely and only clear via a manual `reset`.
 SESSION_TTL_S = _env_int("DELUGE_SESSION_TTL_S", 7200)  # 2 hours idle after finishing
 
-# --- Brightness (MIDI velocity) & timing ------------------------------------
-SOLID_VELOCITY = _env_int("DELUGE_SOLID_VELOCITY", 127)  # working (bright)
-IDLE_VELOCITY = _env_int("DELUGE_IDLE_VELOCITY", 25)     # done/waiting (dim but visible)
-PERM_VELOCITY = _env_int("DELUGE_PERM_VELOCITY", 127)    # permission blink (on phase)
-FLASH_VELOCITY = _env_int("DELUGE_FLASH_VELOCITY", 127)  # transition flash
-FLASH_MS = _env_int("DELUGE_FLASH_MS", 200)              # flash duration
-BLINK_INTERVAL_S = _env_float("DELUGE_BLINK_INTERVAL_S", 0.4)  # permission blink rate
+# --- Brightness (MIDI velocity) & blink rates -------------------------------
+# The grid is white-only: Midigrid renders incoming notes as white with velocity
+# as brightness, so state is carried by BRIGHTNESS + BLINK RATE, not colour.
+#
+#   needs approval -> bright, FAST blink (drops fully off, so it's unmissable)
+#   working        -> bright, SLOW blink (never dims below the idle level)
+#   stopped / idle -> dull, steady (no blink at all)
+#
+# Keep WORK_LOW_VELOCITY comfortably above IDLE_VELOCITY. That's what stops a
+# working pad caught mid-blink from reading as a stopped one.
+SOLID_VELOCITY = _env_int("DELUGE_SOLID_VELOCITY", 127)       # working: blink high
+WORK_LOW_VELOCITY = _env_int("DELUGE_WORK_LOW_VELOCITY", 60)  # working: blink low
+IDLE_VELOCITY = _env_int("DELUGE_IDLE_VELOCITY", 25)          # stopped: steady dull
+PERM_VELOCITY = _env_int("DELUGE_PERM_VELOCITY", 127)         # needs approval: blink high
+PERM_LOW_VELOCITY = _env_int("DELUGE_PERM_LOW_VELOCITY", 0)   # needs approval: blink low
+
+# Blink half-periods in seconds (time at the high level, then time at the low
+# level). The ~5x gap between them is the whole point: it's what makes "needs
+# you" unmistakable next to an ordinary working pad.
+# DELUGE_BLINK_INTERVAL_S is honoured as the old name for the permission rate.
+PERM_BLINK_S = _env_float("DELUGE_PERM_BLINK_S",
+                          _env_float("DELUGE_BLINK_INTERVAL_S", 0.18))
+WORK_BLINK_S = _env_float("DELUGE_WORK_BLINK_S", 0.9)
 
 # --- Watch daemon ------------------------------------------------------------
 # The `watch` service continuously repaints the grid from tracked state so the
 # display always matches reality and self-heals after a Deluge unplug/power-cycle
-# or a Mac sleep. This is how often it reconciles (seconds).
-WATCH_INTERVAL_S = _env_float("DELUGE_WATCH_INTERVAL_S", 1.0)
+# or a Mac sleep. It is ALSO what animates the blinks, so this interval has to be
+# well under the fastest blink half-period above (it only sends a pad when that
+# pad's brightness actually changes, so a tight loop here is cheap on MIDI).
+WATCH_INTERVAL_S = _env_float("DELUGE_WATCH_INTERVAL_S", 0.05)
+# How often the watcher re-reads the state file. The repaint loop runs far faster
+# than state can change, so re-reading JSON every pass would be pure waste.
+WATCH_STATE_POLL_S = _env_float("DELUGE_WATCH_STATE_POLL_S", 0.25)
 # Every this many seconds the watcher forces a full repaint (belt-and-suspenders
 # in case the device silently forgot its LEDs without dropping the USB port).
 WATCH_FULL_REPAINT_S = _env_float("DELUGE_WATCH_FULL_REPAINT_S", 20.0)

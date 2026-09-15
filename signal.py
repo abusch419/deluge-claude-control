@@ -13,11 +13,17 @@ status pad is the first pad in that row (column 0), and each subagent it spawns
   row 1:  [chat B][B.sub1] ...
   (Deluge grid is 16 wide, so the next row up starts 16 notes higher.)
 
-Visual language:
-  working    -> solid lit   (velocity 127, held)
-  idle       -> dim         (velocity 20; chat open, waiting)
-  needs perm -> blinking    (background process toggles the note)
-  closed/off -> off         (velocity 0)
+Visual language (the grid is white-only, so brightness + blink rate carry the
+state -- see config.py):
+  needs approval -> bright, FAST blink (127 <-> 0, ~0.18s)
+  working        -> bright, SLOW blink (127 <-> 60, ~0.9s)
+  stopped / idle -> dull, steady        (velocity 25, no blink)
+  closed / off   -> off                 (velocity 0)
+
+The `watch` daemon is what animates the blinks: it repaints the grid from tracked
+state many times a second, deriving each pad's brightness from its state and the
+clock. Hooks still paint an immediate static frame so you get instant feedback,
+but WITHOUT the daemon running nothing blinks -- pads are just bright or dull.
 
 Events (first CLI arg):
   session_start       chat opened           -> claim row, dim (idle)
@@ -33,7 +39,6 @@ Events (first CLI arg):
   reset               blank the whole grid + wipe state
   refresh             re-sync the grid to tracked state (non-destructive)
   watch               run the self-healing daemon that keeps the grid in sync
-  _blink <note>       (internal) background blink worker
 
 While disabled (a flag file exists), every hook exits immediately without
 touching MIDI, so you can jam on the Deluge with Claude Code running.
@@ -76,7 +81,7 @@ STATE_FILE = CLAUDE_DIR / "deluge_slots.json"
 LOCK_FILE = CLAUDE_DIR / "deluge_slots.lock"
 DEBUG_LOG = CLAUDE_DIR / "hook_debug.log"
 DISABLE_FILE = CLAUDE_DIR / "deluge_disabled"  # presence == muted (for jamming)
-BLINK_PID_DIR = CLAUDE_DIR  # blink pidfiles: deluge_blink_<note>.pid
+BLINK_PID_DIR = CLAUDE_DIR  # legacy blink pidfiles, only ever cleaned up now
 
 # --- Grid layout -------------------------------------------------------------
 # All hardware-specific values live in config.py (edit there, or override via
@@ -92,14 +97,16 @@ FILL_FROM_BOTTOM = config.FILL_FROM_BOTTOM
 MIDI_CHANNEL = config.MIDI_CHANNEL
 SESSION_TTL_S = config.SESSION_TTL_S
 
-# Brightness / timing
+# Brightness / blink rates
 SOLID_VELOCITY = config.SOLID_VELOCITY
+WORK_LOW_VELOCITY = config.WORK_LOW_VELOCITY
 IDLE_VELOCITY = config.IDLE_VELOCITY
 PERM_VELOCITY = config.PERM_VELOCITY
-FLASH_VELOCITY = config.FLASH_VELOCITY
-FLASH_MS = config.FLASH_MS
-BLINK_INTERVAL_S = config.BLINK_INTERVAL_S
+PERM_LOW_VELOCITY = config.PERM_LOW_VELOCITY
+PERM_BLINK_S = config.PERM_BLINK_S
+WORK_BLINK_S = config.WORK_BLINK_S
 WATCH_INTERVAL_S = config.WATCH_INTERVAL_S
+WATCH_STATE_POLL_S = config.WATCH_STATE_POLL_S
 WATCH_FULL_REPAINT_S = config.WATCH_FULL_REPAINT_S
 
 
@@ -305,10 +312,11 @@ def _session_is_blinking(state: dict, sid: str) -> bool:
     row = state["sessions"].get(sid)
     if row is None:
         return False
-    if is_blinking(note_for(row, 0)):
+    marked = blink_notes(state)
+    if note_for(row, 0) in marked:
         return True
     for a in state["agents"].values():
-        if a.get("session") == sid and is_blinking(note_for(row, a.get("col", 0))):
+        if a.get("session") == sid and note_for(row, a.get("col", 0)) in marked:
             return True
     return False
 
@@ -405,66 +413,13 @@ def send_note(note: int, velocity: int, port_name=None) -> None:
         pass
 
 
-def flash_to(note: int, final_velocity: int) -> None:
-    """Brief bright flash then settle to `final_velocity`, to signal a transition."""
-    try:
-        port_name = find_deluge_port()
-        if port_name is None:
-            return
-        import mido
-        with mido.open_output(port_name) as port:
-            port.send(mido.Message("note_on", channel=MIDI_CHANNEL, note=note, velocity=FLASH_VELOCITY))
-            time.sleep(FLASH_MS / 1000.0)
-            port.send(mido.Message("note_on", channel=MIDI_CHANNEL, note=note, velocity=final_velocity))
-    except Exception:
-        pass
-
-
-def flash_off(note: int) -> None:
-    flash_to(note, 0)
-
-
-# --- Blink management --------------------------------------------------------
-def blink_pidfile(note: int) -> Path:
-    return BLINK_PID_DIR / f"deluge_blink_{note}.pid"
-
-
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)  # signal 0: existence check, doesn't actually signal
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # exists but owned by someone else (shouldn't happen here)
-    except Exception:
-        return False
-
-
-def is_blinking(note: int) -> bool:
-    """True only if a blink worker for `note` is genuinely running. A pidfile can
-    outlive its process (e.g. the Mac slept overnight and killed the worker); in
-    that case we clean up the stale file and report False so the pad can be
-    revived by resync_blinks() instead of being silently believed to be blinking."""
-    pf = blink_pidfile(note)
-    try:
-        if not pf.exists():
-            return False
-        pid = int(pf.read_text().strip())
-    except Exception:
-        return False
-    if _pid_alive(pid):
-        return True
-    try:
-        pf.unlink()  # stale: worker is gone
-    except Exception:
-        pass
-    return False
-
-
+# --- Blink state -------------------------------------------------------------
+# Blinking is no longer driven by a background process per pad. Every pad's
+# brightness is a pure function of (tracked state, clock), and the `watch` daemon
+# evaluates that function on every repaint. All that lives on disk is the durable
+# set of notes that need human approval, so the signal survives sleep/reboot.
 def _record_blink(note: int, active: bool) -> None:
-    """Persist (or clear) the durable 'this pad needs intervention' intent in the
-    state file, so a blink survives worker death, sleep, or reboot."""
+    """Persist (or clear) the durable 'this pad needs approval' intent."""
     with state_lock():
         state = _norm(load_state())
         marked = set(state["blink"])
@@ -476,18 +431,70 @@ def _record_blink(note: int, active: bool) -> None:
         save_state(state)
 
 
-def resync_blinks() -> None:
-    """Ensure every pad marked as needing intervention has a live worker.
-    Restarts any workers lost to sleep/reboot/disconnect so a 'needs
-    intervention' signal is never silently dropped."""
+def blink_notes(state=None) -> set:
+    """The set of notes currently waiting on human approval."""
+    if state is None:
+        state = _norm(load_state())
     try:
-        for note in list(_norm(load_state())["blink"]):
-            if not is_blinking(note):
-                _spawn_blink_worker(note)
+        return set(state["blink"])
     except Exception:
-        pass
+        return set()
 
 
+def is_blinking(note: int, state=None) -> bool:
+    return note in blink_notes(state)
+
+
+def start_blink(note: int) -> None:
+    """Mark `note` as needing approval and light it now. The watch daemon picks
+    it up on its next pass and starts the fast blink."""
+    _record_blink(note, True)
+    send_note(note, PERM_VELOCITY)
+
+
+def stop_blink(note: int, final_velocity=None) -> bool:
+    """Clear the 'needs approval' mark on `note`. Returns True if it was set.
+    If final_velocity is given, paint that immediately rather than waiting for
+    the daemon's next pass."""
+    was_marked = is_blinking(note)
+    if was_marked:
+        _record_blink(note, False)
+    if final_velocity is not None:
+        send_note(note, final_velocity)
+    return was_marked
+
+
+def clear_all_blinks() -> None:
+    """Drop every 'needs approval' mark and blank those pads."""
+    notes = blink_notes()
+    with state_lock():
+        state = _norm(load_state())
+        state["blink"] = []
+        save_state(state)
+    for note in notes:
+        send_note(note, 0)
+
+
+# --- Brightness as a function of state + clock -------------------------------
+def _blink_high(now: float, half_period_s: float) -> bool:
+    """True during the lit half of a blink cycle. Driven off the wall clock so
+    every pad in the same state blinks in unison instead of drifting apart."""
+    if half_period_s <= 0:
+        return True
+    return int(now / half_period_s) % 2 == 0
+
+
+def perm_velocity_at(now: float) -> int:
+    """Needs approval: bright, FAST blink, dropping fully off."""
+    return PERM_VELOCITY if _blink_high(now, PERM_BLINK_S) else PERM_LOW_VELOCITY
+
+
+def work_velocity_at(now: float) -> int:
+    """Working: bright, SLOW blink that never dims to the idle level."""
+    return SOLID_VELOCITY if _blink_high(now, WORK_BLINK_S) else WORK_LOW_VELOCITY
+
+
+# --- Legacy cleanup ----------------------------------------------------------
 def _kill_pid(pid: int) -> None:
     """SIGTERM, then escalate to SIGKILL if the process survives (it can defer
     SIGTERM while inside CoreMIDI init). Cheap: only waits if still alive."""
@@ -511,96 +518,10 @@ def _kill_pid(pid: int) -> None:
         pass
 
 
-def stop_blink(note: int, final_velocity=None, clear_record: bool = True) -> bool:
-    """Kill a running blink worker for `note`. Returns True if one was running.
-    If final_velocity is given, set the note to that state afterwards.
-    By default also clears the durable 'needs intervention' record so it won't be
-    revived by resync_blinks (pass clear_record=False to only swap the worker)."""
-    if clear_record:
-        _record_blink(note, False)
-    was_running = False
-    pf = blink_pidfile(note)
-    try:
-        if pf.exists():
-            try:
-                pid = int(pf.read_text().strip())
-                _kill_pid(pid)
-                was_running = True
-            except Exception:
-                pass
-            try:
-                pf.unlink()
-            except Exception:
-                pass
-    except Exception:
-        pass
-    if final_velocity is not None:
-        send_note(note, final_velocity)
-    return was_running
-
-
-def _spawn_blink_worker(note: int) -> None:
-    """Spawn a detached process that pulses `note`. Does NOT touch durable state;
-    used both by start_blink (first request) and resync_blinks (revival)."""
-    try:
-        CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
-        proc = subprocess.Popen(
-            [sys.executable, os.path.abspath(__file__), "_blink", str(note)],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        blink_pidfile(note).write_text(str(proc.pid))
-    except Exception:
-        pass
-
-
-def start_blink(note: int) -> None:
-    """Mark `note` as needing intervention (durably) and spawn its blink worker."""
-    stop_blink(note, clear_record=False)  # never run two blinkers on the same note
-    _record_blink(note, True)             # durable intent: survives sleep/reboot
-    _spawn_blink_worker(note)
-
-
-def blink_worker(note: int) -> None:
-    """Runs in a detached process: pulse `note` until SIGTERM.
-
-    Resilient by design so a "needs intervention" signal is never lost:
-      - If the Deluge isn't present yet, wait and keep retrying.
-      - If the connection drops mid-blink, reopen the port and resume (this also
-        re-lights the pad after the device is unplugged/replugged or rebooted).
-    It only ever stops when explicitly killed (stop_blink / reset).
-    """
-    try:
-        import mido
-    except Exception:
-        return
-
-    on = True
-    while True:  # outer loop: (re)acquire the port forever
-        port_name = find_deluge_port()
-        if port_name is None:
-            time.sleep(1.0)  # device absent; wait and retry (don't die)
-            continue
-        try:
-            with mido.open_output(port_name) as port:
-                while True:  # inner loop: blink while the port is healthy
-                    vel = PERM_VELOCITY if on else 0
-                    try:
-                        port.send(mido.Message("note_on", channel=MIDI_CHANNEL,
-                                               note=note, velocity=vel))
-                    except Exception:
-                        break  # connection likely dropped -> reopen it
-                    on = not on
-                    time.sleep(BLINK_INTERVAL_S)
-        except Exception:
-            time.sleep(1.0)  # couldn't open (e.g. mid-reconnect); retry
-
-
 def kill_stray_workers() -> None:
-    """Belt-and-suspenders: kill any lingering blink workers by command match,
-    even ones whose pidfile was lost. Only used by `reset`, not the hot path."""
+    """Kill any blink workers left over from an older version of this script, and
+    delete their pidfiles. Nothing spawns these any more; this only runs on
+    `reset` / `disable` so an upgrade can't leave a pad pulsing forever."""
     try:
         out = subprocess.run(
             ["pgrep", "-f", "signal.py _blink"],
@@ -616,40 +537,18 @@ def kill_stray_workers() -> None:
                 pass
     except Exception:
         pass
-
-
-def clear_all_blinks() -> None:
     try:
         for pf in BLINK_PID_DIR.glob("deluge_blink_*.pid"):
-            try:
-                note = int(pf.stem.replace("deluge_blink_", ""))
-            except Exception:
-                note = None
-            try:
-                pid = int(pf.read_text().strip())
-                _kill_pid(pid)
-            except Exception:
-                pass
             try:
                 pf.unlink()
             except Exception:
                 pass
-            if note is not None:
-                send_note(note, 0)
     except Exception:
         pass
 
 
 # --- Main --------------------------------------------------------------------
 def main() -> None:
-    # Internal blink worker mode (spawned detached; not a real hook event).
-    if len(sys.argv) >= 3 and sys.argv[1] == "_blink":
-        try:
-            blink_worker(int(sys.argv[2]))
-        except Exception:
-            pass
-        sys.exit(0)
-
     # Long-running watch daemon: continuously reconciles the grid with state.
     if len(sys.argv) >= 2 and sys.argv[1] == "watch":
         try:
@@ -698,71 +597,77 @@ _STATUS_EVENTS = {
 }
 
 
+def _desired_grid(state: dict, now: float) -> dict:
+    """Target velocity for every pad, a pure function of tracked state + clock:
+
+      needs approval -> fast blink between PERM_VELOCITY and PERM_LOW_VELOCITY
+      working        -> slow blink between SOLID_VELOCITY and WORK_LOW_VELOCITY
+      stopped / idle -> steady IDLE_VELOCITY (dull, no blink)
+
+    A chat counts as working until it finishes a turn (which is what puts it in
+    `idle_since`); subagents only exist in state while they're running, so their
+    pads always show the working blink. Notes not listed here are off (0).
+    Needing approval wins over working -- that's the one you have to act on.
+    """
+    desired = {}
+    sessions = state["sessions"]
+    idle = state["idle_since"]
+    work_vel = work_velocity_at(now)
+    perm_vel = perm_velocity_at(now)
+    for sid, row in sessions.items():
+        desired[note_for(row, 0)] = IDLE_VELOCITY if sid in idle else work_vel
+    for a in state["agents"].values():
+        row = sessions.get(a.get("session"))
+        if row is not None:
+            desired[note_for(row, a.get("col", 0))] = work_vel
+    for note in blink_notes(state):
+        desired[note] = perm_vel
+    return desired
+
+
 def _refresh_grid() -> None:
     """Redraw the whole grid from the tracked state in one MIDI pass.
 
-    Chats settle to IDLE (dim), still-tracked subagents show SOLID, every other
-    pad is blanked, and notes with a live blink worker are left untouched so a
-    pending permission request keeps pulsing.
+    A single frame only -- the `watch` daemon is what keeps the blinks moving.
+    Used by `enable` and `refresh` so the display catches up immediately instead
+    of waiting for the next hook.
     """
     try:
         import mido
     except Exception:
         return
-    resync_blinks()  # revive any intervention blinks lost to sleep/reboot first
     port_name = find_deluge_port()
     if port_name is None:
         return
 
-    state = _norm(load_state())
-    targets = {}
-    for sid, row in state["sessions"].items():
-        targets[note_for(row, 0)] = IDLE_VELOCITY
-    for a in state["agents"].values():
-        row = state["sessions"].get(a.get("session"))
-        if row is not None:
-            targets[note_for(row, a.get("col", 0))] = SOLID_VELOCITY
-
+    desired = _desired_grid(_norm(load_state()), time.time())
     try:
         with mido.open_output(port_name) as port:
             for note in range(BASE_NOTE, BASE_NOTE + NUM_ROWS * ROW_WIDTH):
-                if is_blinking(note):
-                    continue  # let the blink worker own this pad
                 try:
                     port.send(mido.Message(
                         "note_on", channel=MIDI_CHANNEL,
-                        note=note, velocity=targets.get(note, 0)))
+                        note=note, velocity=desired.get(note, 0)))
                 except Exception:
                     pass
     except Exception:
         pass
 
 
-def _desired_grid(state: dict) -> dict:
-    """Target velocity for every steady (non-blink) pad, derived purely from
-    tracked state: a chat is SOLID while working, IDLE (dim) once it has finished
-    a turn, and each live subagent pad is SOLID. Notes not present are off (0)."""
-    desired = {}
-    sessions = state["sessions"]
-    idle = state["idle_since"]
-    for sid, row in sessions.items():
-        desired[note_for(row, 0)] = IDLE_VELOCITY if sid in idle else SOLID_VELOCITY
-    for a in state["agents"].values():
-        row = sessions.get(a.get("session"))
-        if row is not None:
-            desired[note_for(row, a.get("col", 0))] = SOLID_VELOCITY
-    return desired
-
-
 def watch_loop() -> None:
     """Continuously reconcile the Deluge grid with tracked state.
 
-    This is the reliability backbone: instead of only painting when a hook fires,
-    the watcher repaints from state every WATCH_INTERVAL_S, so the display always
-    reflects reality and SELF-HEALS after a Deluge unplug/power-cycle or a Mac
-    sleep. It diff-paints (only sends changed pads) to stay quiet, forces a full
-    repaint periodically, blanks the grid while muted, and leaves actively
-    blinking pads to their blink workers.
+    This is both the reliability backbone and the animator. Instead of only
+    painting when a hook fires, it repaints from state every WATCH_INTERVAL_S,
+    so the display always reflects reality and SELF-HEALS after a Deluge
+    unplug/power-cycle or a Mac sleep -- and because each pad's brightness is a
+    function of the clock, repainting fast enough is exactly what produces the
+    slow (working) and fast (needs approval) blinks.
+
+    It diff-paints (only sends pads whose brightness actually changed) so a tight
+    loop stays quiet on the wire, re-reads the state file only every
+    WATCH_STATE_POLL_S, forces a full repaint periodically, and blanks the grid
+    while muted.
     """
     try:
         import mido
@@ -776,6 +681,8 @@ def watch_loop() -> None:
             continue
         painted = {}            # note -> last velocity we sent (reset on reconnect)
         last_full = 0.0         # force an initial full paint
+        state = None
+        last_poll = 0.0
         try:
             with mido.open_output(port_name) as out:
                 while True:
@@ -784,15 +691,16 @@ def watch_loop() -> None:
                         painted.clear()  # heal any silent drift
                         last_full = now
 
-                    if is_disabled():   # muted for jamming: keep the grid dark
+                    muted = is_disabled()
+                    if muted:           # muted for jamming: keep the grid dark
                         desired = {}
                     else:
-                        desired = _desired_grid(_norm(load_state()))
+                        if state is None or now - last_poll >= WATCH_STATE_POLL_S:
+                            state = _norm(load_state())
+                            last_poll = now
+                        desired = _desired_grid(state, now)
 
                     for n in grid:
-                        if not is_disabled() and is_blinking(n):
-                            painted.pop(n, None)  # blink worker owns it; repaint later
-                            continue
                         vel = desired.get(n, 0)
                         if painted.get(n) != vel:
                             out.send(mido.Message("note_on", channel=MIDI_CHANNEL,
@@ -809,9 +717,6 @@ def _dispatch(event: str, payload: dict) -> None:
     # Any activity refreshes this chat's idle timer and expires stale chats
     # (whose close event Claude Code never delivered), blanking their pads.
     if event in _STATUS_EVENTS:
-        # Self-heal: if any intervention blink lost its worker (Mac slept,
-        # reboot, device unplugged), revive it so the signal isn't lost.
-        resync_blinks()
         for note in touch_and_prune(sid, event):
             stop_blink(note)
             send_note(note, 0)
@@ -822,13 +727,15 @@ def _dispatch(event: str, payload: dict) -> None:
         send_note(note, IDLE_VELOCITY)
 
     elif event == "working":
-        # Chat submitted a prompt -> its pad solid (working).
+        # Chat submitted a prompt -> working. Light it bright now; the watch
+        # daemon takes over and gives it the slow working blink.
         note = note_for(claim_session_row(sid), 0)
         stop_blink(note)
         send_note(note, SOLID_VELOCITY)
 
     elif event == "permission_request":
-        # Blink the pad of whoever asked (subagent if inside one, else the chat).
+        # Whoever asked (subagent if inside one, else the chat) needs approval:
+        # mark it, and the watch daemon switches that pad to the fast blink.
         note = claim_key_note(payload)
         start_blink(note)
 
@@ -842,17 +749,17 @@ def _dispatch(event: str, payload: dict) -> None:
             note = claim_key_note(payload)
             send_note(note, SOLID_VELOCITY)
         elif is_blinking(note):
-            # Pad was blinking for a permission prompt -> prompt resolved, go
-            # back to solid. Otherwise stay cheap: no MIDI on the hot path.
+            # Pad was fast-blinking for a permission prompt -> approved, so drop
+            # back to the working blink. Otherwise stay cheap: no MIDI here.
             stop_blink(note, final_velocity=SOLID_VELOCITY)
 
     elif event == "stop":
-        # Chat finished responding -> flash then settle to dim (idle). Keep the
-        # row; the chat's pad stays visible (dim) until the chat closes.
+        # Chat finished responding -> stop blinking and settle to steady dull.
+        # Keep the row; the pad stays visible (dull) until the chat closes.
         note = peek_session_note(sid)
         if note is not None:
             stop_blink(note)
-            flash_to(note, IDLE_VELOCITY)
+            send_note(note, IDLE_VELOCITY)
 
     elif event == "session_end":
         # Chat closed -> free its row and all its subagents, blank their pads.
@@ -870,17 +777,17 @@ def _dispatch(event: str, payload: dict) -> None:
         note = free_agent(aid) if aid else peek_session_note(sid)
         if note is not None:
             stop_blink(note)
-            flash_off(note)
+            send_note(note, 0)
 
     elif event == "disable":
-        # Mute for jamming: set the flag, stop blinks, blank the whole grid.
-        # State is kept so re-enabling picks up where chats left off.
+        # Mute for jamming: set the flag and blank the whole grid. State is
+        # kept -- including which pads need approval -- so `enable` picks up
+        # exactly where the chats left off.
         try:
             CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
             DISABLE_FILE.write_text("1")
         except Exception:
             pass
-        clear_all_blinks()
         kill_stray_workers()
         for note in range(BASE_NOTE, BASE_NOTE + NUM_ROWS * ROW_WIDTH):
             send_note(note, 0)
@@ -897,8 +804,8 @@ def _dispatch(event: str, payload: dict) -> None:
 
     elif event == "refresh":
         # Re-sync the physical grid to the tracked state without wiping it:
-        # blank stray pads, redraw chats (dim/idle) and subagents (solid),
-        # and leave any active permission blinks running.
+        # blank stray pads and redraw every tracked chat and subagent. Paints one
+        # frame; the watch daemon resumes animating from there.
         _refresh_grid()
 
     elif event == "reset":
