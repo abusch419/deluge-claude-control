@@ -98,6 +98,7 @@ NUM_ROWS = config.NUM_ROWS
 FILL_FROM_BOTTOM = config.FILL_FROM_BOTTOM
 MIDI_CHANNEL = config.MIDI_CHANNEL
 SESSION_TTL_S = config.SESSION_TTL_S
+UNTRACKED_TTL_S = config.UNTRACKED_TTL_S
 
 # Brightness / blink rates
 SOLID_VELOCITY = config.SOLID_VELOCITY
@@ -308,6 +309,27 @@ def record_owner(sid: str) -> None:
         pass
 
 
+def sweep_sessions():
+    """Clear chats that are gone, by whichever test applies. Returns notes.
+
+    Run by the watch daemon rather than by hooks, because a closed chat fires no
+    hooks: if it were only checked on someone else's event, the last chat you
+    close would leave its pad lit until you started another one.
+    """
+    notes = list(prune_dead_sessions())
+    try:
+        now = time.time()
+        with state_lock():
+            state = _norm(load_state())
+            idle_notes = _expire_idle(state, now)
+            if idle_notes:
+                save_state(state)
+        notes.extend(idle_notes)
+    except Exception:
+        pass
+    return notes
+
+
 def prune_dead_sessions():
     """Clear every chat whose owning process has exited. Returns notes to blank.
 
@@ -473,41 +495,81 @@ _IDLE_EVENTS = {"session_start", "stop"}
 _ACTIVE_EVENTS = {"working", "permission_request", "posttool", "subagent_start"}
 
 
-def touch_and_prune(sid: str, event: str):
-    """Update `sid`'s idle/active bookkeeping for this event, then expire any OTHER
-    chat that FINISHED a turn and then stayed idle longer than SESSION_TTL_S.
+def _pid_share_counts(state: dict) -> dict:
+    """{pid: how many chats claim it}. Snapshotted before any expiry runs: each
+    removal drops an owner entry, so counting lazily would make the last chat
+    sharing a process look like it had one to itself and stop expiring."""
+    counts = {}
+    for owner in state["owners"].values():
+        pid = owner.get("pid")
+        counts[pid] = counts.get(pid, 0) + 1
+    return counts
 
-    The VS Code extension never fires SessionEnd on tab close, so we approximate
-    "closed" as "finished and then abandoned". A chat that is actively working
-    (its last event was a prompt/tool use, so it has no idle timestamp) is never
-    expired, and a blinking pad (needs intervention) is never expired. With
-    SESSION_TTL_S == 0, nothing is expired. Returns notes to blank."""
-    expired_notes = []
+
+def _effective_ttl(state: dict, sid: str, shares=None) -> int:
+    """How long this chat may sit idle before we assume it's gone.
+
+    A chat we can watch by process needs no timeout at all: it disappears the
+    moment its process does, so leaving one open and untouched all afternoon
+    keeps its pad. A timeout is only a guess for chats we CAN'T watch, and there
+    are two of those:
+
+      - no owner process was identified at all, and
+      - several chats share one process, so the process being alive says nothing
+        about whether this particular chat is still open (an editor that runs one
+        Claude Code process behind several tabs looks like this).
+
+    Those fall back to UNTRACKED_TTL_S, which is short on purpose -- guessing
+    late leaves dead pads lit, and guessing early costs nothing, since the pad
+    comes straight back on the chat's next prompt.
+    """
+    owner = state["owners"].get(sid)
+    if not owner:
+        return UNTRACKED_TTL_S
+    if shares is None:
+        shares = _pid_share_counts(state)
+    return UNTRACKED_TTL_S if shares.get(owner.get("pid"), 0) > 1 else SESSION_TTL_S
+
+
+def _expire_idle(state: dict, now: float, skip_sid=None):
+    """Drop chats that finished a turn and then sat idle past their TTL
+    (unlocked; caller holds the lock). Returns notes to blank.
+
+    A chat that is actively working has no idle clock and is never expired, no
+    matter how long it runs, and a pad waiting on your approval is never expired
+    either -- that signal has to survive until you deal with it.
+    """
+    notes = []
+    shares = _pid_share_counts(state)
+    for sid in list(state["sessions"].keys()):
+        if sid == skip_sid:
+            continue
+        ttl = _effective_ttl(state, sid, shares)
+        if ttl <= 0:
+            continue
+        if _session_is_blinking(state, sid):
+            continue
+        ts = state["idle_since"].get(sid)
+        if ts is None:  # never finished a turn (still working): keep
+            continue
+        if now - ts > ttl:
+            notes.extend(_remove_session(state, sid))
+    return notes
+
+
+def touch_and_prune(sid: str, event: str):
+    """Update `sid`'s idle/active bookkeeping for this event, then expire any
+    OTHER chat that has been idle past its TTL. Returns notes to blank."""
     now = time.time()
     with state_lock():
         state = _norm(load_state())
-        seen = state["seen"]
-        idle_since = state["idle_since"]
         if sid:
-            seen[sid] = now
+            state["seen"][sid] = now
             if event in _IDLE_EVENTS:
-                idle_since[sid] = now          # finished/waiting -> start idle clock
+                state["idle_since"][sid] = now   # finished/waiting -> idle clock
             elif event in _ACTIVE_EVENTS:
-                idle_since.pop(sid, None)       # actively working -> not expirable
-        if SESSION_TTL_S > 0:
-            stale = []
-            for s in list(state["sessions"].keys()):
-                if s == sid:
-                    continue
-                if _session_is_blinking(state, s):  # needs intervention: never expire
-                    continue
-                ts = idle_since.get(s)
-                if ts is None:  # never finished a turn (still working): keep
-                    continue
-                if now - ts > SESSION_TTL_S:
-                    stale.append(s)
-            for s in stale:
-                expired_notes.extend(_remove_session(state, s))
+                state["idle_since"].pop(sid, None)  # working -> not expirable
+        expired_notes = _expire_idle(state, now, skip_sid=sid)
         save_state(state)
     return expired_notes
 
@@ -879,11 +941,12 @@ def watch_loop() -> None:
                         painted.clear()  # heal any silent drift
                         last_full = now
 
-                    # Clear chats whose process is gone (window/tab closed, or
-                    # Claude Code crashed) -- the case no hook can catch.
+                    # Clear chats that are gone: process exited (window closed,
+                    # or Claude Code crashed), or idle past their TTL. Neither
+                    # case fires a hook, so the daemon has to notice on its own.
                     if WATCH_LIVENESS_S > 0 and now - last_liveness >= WATCH_LIVENESS_S:
                         last_liveness = now
-                        if prune_dead_sessions():
+                        if sweep_sessions():
                             state = None  # state changed: re-read it below
 
                     muted = is_disabled()

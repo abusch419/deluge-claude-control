@@ -74,15 +74,25 @@ NUM_ROWS = _env_int("DELUGE_NUM_ROWS", 8)      # grid height -> max concurrent c
 # BOTTOM row and new chats fill upward. Flip this if it fills the wrong way.
 FILL_FROM_BOTTOM = _env_bool("DELUGE_FILL_FROM_BOTTOM", False)
 
-# --- Idle expiry -------------------------------------------------------------
-# How a finished chat's pad auto-clears. The VS Code Claude Code extension does
-# NOT fire SessionEnd when you close a tab, so a closed chat can't be detected
-# directly. Instead, a chat is cleared only once it has FINISHED a turn (Stop)
-# and then stayed idle this many seconds. A chat that is actively working (its
-# last event was a prompt/tool use) is NEVER expired, no matter how long it runs,
-# and a BLINKING pad (needs you) is never expired either. Set to 0 to disable
-# auto-expiry entirely and only clear via a manual `reset`.
-SESSION_TTL_S = _env_int("DELUGE_SESSION_TTL_S", 7200)  # 2 hours idle after finishing
+# --- Clearing closed chats ---------------------------------------------------
+# A chat's pad clears when its Claude Code process exits -- see WATCH_LIVENESS_S
+# below. That covers closing a window, quitting, and crashing, none of which fire
+# any hook. The two timeouts here are only for chats that CAN'T be watched that
+# way, and they're applied automatically per chat; you shouldn't need to touch
+# either one.
+#
+# SESSION_TTL_S applies to a chat with its own identified process. That process
+# dying already clears the pad, so there's nothing left for a timeout to catch
+# and the default is 0 (never expire) -- leave a chat open and idle all afternoon
+# and its pad stays put.
+SESSION_TTL_S = _env_int("DELUGE_SESSION_TTL_S", 0)
+
+# UNTRACKED_TTL_S applies to a chat we can't watch by process: either none was
+# identified, or several chats share one process so its being alive says nothing
+# about this chat (an editor running one Claude Code process behind several tabs
+# looks like this). Kept short on purpose -- guessing late leaves dead pads lit,
+# and guessing early costs nothing, since the pad returns on the next prompt.
+UNTRACKED_TTL_S = _env_int("DELUGE_UNTRACKED_TTL_S", 900)  # 15 minutes
 
 # --- Brightness (MIDI velocity) & blink rates -------------------------------
 # The grid is white-only: Midigrid renders incoming notes as white with velocity

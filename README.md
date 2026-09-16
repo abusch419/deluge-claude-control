@@ -110,9 +110,11 @@ name). The important ones:
 - `BASE_NOTE` — the first grid pad to use.
 - `ROW_WIDTH` — grid width / row stride (16 on a standard Deluge).
 - `NUM_ROWS` — max concurrent chats.
-- `SESSION_TTL_S` — a chat's pad auto-clears once it has **finished a turn and
-  then stayed idle** this many seconds (default 7200 = 2h; `0` disables it). See
-  "Idle expiry" below.
+- `UNTRACKED_TTL_S` — fallback timeout, in seconds, for chats that can't be
+  watched by process (default 900 = 15min). Applied automatically and only where
+  it's needed; see "Clearing a closed chat" below. `SESSION_TTL_S` is the same
+  timeout for chats that *can* be watched, and defaults to `0` (never) because
+  their process exiting already clears them.
 - `SOLID_VELOCITY` — brightness of a working pad (default 127, steady).
 - `IDLE_HIGH_VELOCITY` / `IDLE_LOW_VELOCITY` — the two levels a done pad blinks
   between (default 60 / 15). Keep both well below `SOLID_VELOCITY`, and raise the
@@ -254,32 +256,27 @@ that never arrives is why pads used to pile up.
 So the display doesn't wait for one. On the first hook a chat fires, it records
 **which process owns that chat**, found by walking up the hook's own ancestry
 (a hook always runs as a descendant of the Claude Code process that fired it).
-The watch daemon then checks every `WATCH_LIVENESS_S` seconds whether those
-processes are still alive, and clears the pads of the ones that aren't. Closing a
-window, closing a tab, or Claude Code crashing all look the same from here: the
-process is gone, so within a few seconds the pad goes out.
+The watch daemon checks every `WATCH_LIVENESS_S` seconds whether those processes
+are still alive and clears the pads of the ones that aren't. Closing a window,
+quitting, and crashing all look the same from here: the process is gone, so
+within a few seconds the pad goes out. Because that test is exact, a chat you
+leave open and untouched all afternoon keeps its pad — there's no timeout on it.
 
-The pid is stored with its start time, because pids get recycled — without that,
-an unrelated process inheriting the number would keep a dead chat's pad lit
-forever.
+Two cases can't be settled that way: a chat whose process couldn't be identified,
+and several chats sharing one process, where that process being alive says
+nothing about whether this particular chat is still open (an editor running one
+Claude Code process behind several tabs looks like this). The display detects
+both on its own and falls back to a timeout for those chats only: they clear once
+they've finished a turn and then sat idle for `UNTRACKED_TTL_S` (default 15
+minutes). That's short on purpose — guessing late leaves dead pads lit, and
+guessing early costs nothing, since the pad comes straight back on the chat's
+next prompt. A chat that is actively working has no idle clock and is never
+expired however long it runs, and a pad waiting on your approval is never
+expired either.
 
-To see what it's tracking, and whether it managed to identify your processes:
-
-```bash
-python3 /path/to/deluge-claude/signal.py sessions
-```
-
-A chat showing `owner=?` couldn't be tied to a process, so it falls back to the
-older safety net below. If every chat shows that, something about how your
-Claude Code is launched is hiding the process — file an issue with the output of
-`ps -eo pid=,ppid=,command= | grep -i claude`.
-
-**Idle expiry (the fallback).** For chats with no identified owner, a pad
-auto-clears once it has finished a turn (`Stop`) and then stayed idle for
-`SESSION_TTL_S` seconds (default 2h). A chat that is actively working has no idle
-clock and is never expired, no matter how long it runs; a pad waiting on your
-approval is never expired either. Set `SESSION_TTL_S=0` to disable this entirely,
-and `WATCH_LIVENESS_S=0` to disable the process check.
+All of this is automatic and per chat; you shouldn't need to configure or check
+anything. If you're curious what it's tracking, `signal.py sessions` prints each
+chat with its owner process and whether that process is alive.
 
 Runtime state lives in `~/.claude/` (outside this repo): `deluge_slots.json`,
 `deluge_disabled`, `hook_debug.log`.
