@@ -122,6 +122,8 @@ name). The important ones:
 - `IDLE_BLINK_S` / `PERM_BLINK_S` — blink half-periods in seconds (default 0.9
   and 0.18). Keep them far apart or the two states stop being distinguishable.
 - `WATCH_INTERVAL_S` — how often the watch service reconciles the grid.
+- `WATCH_LIVENESS_S` — how often it checks whether each chat's Claude Code
+  process is still alive and clears the dead ones (default 5s; `0` disables).
 
 Verify it can talk to the device:
 
@@ -208,6 +210,9 @@ python3 /path/to/deluge-claude/signal.py enable < /dev/null
 
 # Blank the whole grid and wipe all chat/slot state
 python3 /path/to/deluge-claude/signal.py reset < /dev/null
+
+# Show what's tracked, and whether each chat's process is still alive
+python3 /path/to/deluge-claude/signal.py sessions
 ```
 
 `disable` / `enable` / `reset` always work, even while muted, so you can't get
@@ -234,20 +239,47 @@ hook JSON payload from stdin:
 | `disable` / `enable` | manual                  | mute / unmute                      |
 | `reset`              | manual                  | blank grid + wipe state            |
 | `refresh`            | manual                  | re-sync grid to state (no wipe)    |
+| `sessions`           | manual                  | print tracked chats + owner pids   |
 | `watch`              | service                 | continuously reconcile the grid    |
 
 Add `--debug` to append raw stdin payloads to `~/.claude/hook_debug.log`.
 
-### Idle expiry
+### Clearing a closed chat
 
-Claude Code doesn't reliably fire a "chat closed" event — in particular, the VS
-Code extension does **not** fire `SessionEnd` when you close a tab. So pads would
-otherwise pile up and drift from the chats you actually have open. To prevent
-that, a chat's pad **auto-clears once it has finished a turn (`Stop`) and then
-stayed idle for `SESSION_TTL_S` seconds** (default 2h). A chat that is actively
-working has no idle clock and is **never** expired, no matter how long it runs;
-a pad waiting on your approval is never expired either. Set `SESSION_TTL_S=0` to
-disable expiry entirely and only clear via a manual `reset`.
+Closing a terminal window or an editor tab kills the Claude Code process
+outright. There's no clean shutdown, so there's no moment at which a `SessionEnd`
+hook could run — no hook configuration can catch that case. Waiting for an event
+that never arrives is why pads used to pile up.
+
+So the display doesn't wait for one. On the first hook a chat fires, it records
+**which process owns that chat**, found by walking up the hook's own ancestry
+(a hook always runs as a descendant of the Claude Code process that fired it).
+The watch daemon then checks every `WATCH_LIVENESS_S` seconds whether those
+processes are still alive, and clears the pads of the ones that aren't. Closing a
+window, closing a tab, or Claude Code crashing all look the same from here: the
+process is gone, so within a few seconds the pad goes out.
+
+The pid is stored with its start time, because pids get recycled — without that,
+an unrelated process inheriting the number would keep a dead chat's pad lit
+forever.
+
+To see what it's tracking, and whether it managed to identify your processes:
+
+```bash
+python3 /path/to/deluge-claude/signal.py sessions
+```
+
+A chat showing `owner=?` couldn't be tied to a process, so it falls back to the
+older safety net below. If every chat shows that, something about how your
+Claude Code is launched is hiding the process — file an issue with the output of
+`ps -eo pid=,ppid=,command= | grep -i claude`.
+
+**Idle expiry (the fallback).** For chats with no identified owner, a pad
+auto-clears once it has finished a turn (`Stop`) and then stayed idle for
+`SESSION_TTL_S` seconds (default 2h). A chat that is actively working has no idle
+clock and is never expired, no matter how long it runs; a pad waiting on your
+approval is never expired either. Set `SESSION_TTL_S=0` to disable this entirely,
+and `WATCH_LIVENESS_S=0` to disable the process check.
 
 Runtime state lives in `~/.claude/` (outside this repo): `deluge_slots.json`,
 `deluge_disabled`, `hook_debug.log`.

@@ -126,6 +126,12 @@ WATCH_INTERVAL_S = _env_float("DELUGE_WATCH_INTERVAL_S", 0.05)
 # How often the watcher re-reads the state file. The repaint loop runs far faster
 # than state can change, so re-reading JSON every pass would be pure waste.
 WATCH_STATE_POLL_S = _env_float("DELUGE_WATCH_STATE_POLL_S", 0.25)
+# How often the watcher checks whether each chat's Claude Code process is still
+# alive, and clears the pads of the ones that aren't. This is what makes a pad go
+# out when you close a window or tab, which fires no hook at all. Costs one `ps`
+# call each time, so don't set it very low. 0 disables the check entirely and
+# leaves closed chats to idle expiry (SESSION_TTL_S).
+WATCH_LIVENESS_S = _env_float("DELUGE_WATCH_LIVENESS_S", 5.0)
 # Every this many seconds the watcher forces a full repaint (belt-and-suspenders
 # in case the device silently forgot its LEDs without dropping the USB port).
 WATCH_FULL_REPAINT_S = _env_float("DELUGE_WATCH_FULL_REPAINT_S", 20.0)

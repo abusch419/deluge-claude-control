@@ -39,6 +39,7 @@ Events (first CLI arg):
   enable              unmute; hooks resume lighting pads
   reset               blank the whole grid + wipe state
   refresh             re-sync the grid to tracked state (non-destructive)
+  sessions            print tracked chats + whether their processes are alive
   watch               run the self-healing daemon that keeps the grid in sync
 
 While disabled (a flag file exists), every hook exits immediately without
@@ -108,6 +109,7 @@ PERM_BLINK_S = config.PERM_BLINK_S
 IDLE_BLINK_S = config.IDLE_BLINK_S
 WATCH_INTERVAL_S = config.WATCH_INTERVAL_S
 WATCH_STATE_POLL_S = config.WATCH_STATE_POLL_S
+WATCH_LIVENESS_S = config.WATCH_LIVENESS_S
 WATCH_FULL_REPAINT_S = config.WATCH_FULL_REPAINT_S
 
 
@@ -192,6 +194,8 @@ def _norm(state) -> dict:
         state["blink"] = []
     if not isinstance(state.get("idle_since"), dict):
         state["idle_since"] = {}
+    if not isinstance(state.get("owners"), dict):
+        state["owners"] = {}
     return state
 
 
@@ -208,6 +212,142 @@ def note_for(row: int, col: int) -> int:
     # so new chats stack upward.
     physical = (NUM_ROWS - 1 - row) if FILL_FROM_BOTTOM else row
     return BASE_NOTE + physical * ROW_WIDTH + col
+
+
+# --- Owning process ----------------------------------------------------------
+# Claude Code can't always tell us a chat closed: closing a terminal window or an
+# editor tab kills the process outright, so there's no clean shutdown in which a
+# SessionEnd hook could run. Rather than trust an event that may never arrive, we
+# record WHICH PROCESS owns each chat and let the watch daemon notice when that
+# process is gone. Pads then clear on close no matter how the chat died.
+#
+# A hook runs as a descendant of the Claude Code process that fired it, so we
+# find the owner by walking up our own ancestry. We store the pid together with
+# its start time, because pids get recycled and a stale pid that some unrelated
+# process later inherits would keep a dead chat's pad lit forever.
+_CLAUDE_MARKERS = ("@anthropic-ai/claude-code", "claude-code/cli.js")
+
+
+def _looks_like_claude(command: str) -> bool:
+    """True if this process is a Claude Code CLI.
+
+    Matched on argv[0]'s basename, never a substring of the whole command line:
+    this script usually lives in a directory with `claude` in its name, so a
+    substring test would happily identify our own hook process as the chat.
+    """
+    argv0 = command.split()[0] if command.split() else ""
+    if os.path.basename(argv0) == "claude":
+        return True
+    return any(marker in command for marker in _CLAUDE_MARKERS)
+
+
+def _process_table() -> dict:
+    """{pid: (ppid, command)} for every process, in one `ps` call."""
+    table = {}
+    try:
+        out = subprocess.run(["ps", "-eo", "pid=,ppid=,command="],
+                             capture_output=True, text=True, timeout=5)
+        for line in out.stdout.splitlines():
+            parts = line.strip().split(None, 2)
+            if len(parts) == 3:
+                table[int(parts[0])] = (int(parts[1]), parts[2])
+    except Exception:
+        pass
+    return table
+
+
+def _started_at(pid: int) -> str:
+    """The process's start time, as a stable string. Empty if it's gone."""
+    try:
+        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=5)
+        return out.stdout.strip()
+    except Exception:
+        return ""
+
+
+def find_owner_process():
+    """Walk up our own ancestry to the Claude Code process that fired this hook.
+    Returns {'pid': int, 'started': str}, or None if we can't identify one (in
+    which case that chat just falls back to idle expiry)."""
+    table = _process_table()
+    if not table:
+        return None
+    pid = os.getpid()
+    for _ in range(12):  # generous depth cap; the chain is normally 2-3 deep
+        entry = table.get(pid)
+        if entry is None:
+            return None
+        ppid, _cmd = entry
+        if ppid <= 1:
+            return None
+        parent = table.get(ppid)
+        if parent is None:
+            return None
+        if _looks_like_claude(parent[1]):
+            started = _started_at(ppid)
+            return {"pid": ppid, "started": started} if started else None
+        pid = ppid
+    return None
+
+
+def record_owner(sid: str) -> None:
+    """Remember which process owns `sid`, if we don't already know. Costs one or
+    two `ps` calls the first time a chat is seen, then nothing."""
+    try:
+        if not sid or sid in _norm(load_state())["owners"]:
+            return
+        owner = find_owner_process()
+        if owner is None:
+            return
+        with state_lock():
+            state = _norm(load_state())
+            state["owners"][sid] = owner
+            save_state(state)
+    except Exception:
+        pass
+
+
+def prune_dead_sessions():
+    """Clear every chat whose owning process has exited. Returns notes to blank.
+
+    A recorded pid counts as dead if it's gone, or if it's alive but started at a
+    different time than we recorded -- that means the pid was recycled and now
+    belongs to something else entirely.
+    """
+    try:
+        owners = _norm(load_state())["owners"]
+        if not owners:
+            return []
+        pids = sorted({int(o["pid"]) for o in owners.values() if o.get("pid")})
+        alive = {}
+        try:
+            out = subprocess.run(
+                ["ps", "-o", "pid=,lstart=", "-p", ",".join(str(p) for p in pids)],
+                capture_output=True, text=True, timeout=5)
+            for line in out.stdout.splitlines():
+                parts = line.strip().split(None, 1)
+                if len(parts) == 2:
+                    alive[int(parts[0])] = parts[1].strip()
+        except Exception:
+            return []  # can't tell; never guess a chat dead
+
+        notes = []
+        with state_lock():
+            state = _norm(load_state())
+            for sid, owner in list(state["owners"].items()):
+                pid, started = owner.get("pid"), owner.get("started", "")
+                if alive.get(pid) == started:
+                    continue  # same process, still running
+                if sid in state["sessions"]:
+                    notes.extend(_remove_session(state, sid))
+                else:
+                    state["owners"].pop(sid, None)
+            if notes:
+                save_state(state)
+        return notes
+    except Exception:
+        return []
 
 
 # --- Identity ----------------------------------------------------------------
@@ -289,11 +429,16 @@ def _remove_session(state: dict, sid: str):
     row = sessions.pop(sid, None)
     state.get("seen", {}).pop(sid, None)
     state.get("idle_since", {}).pop(sid, None)
+    state.get("owners", {}).pop(sid, None)
     if row is not None:
         notes.append(note_for(row, 0))
         for aid in [k for k, v in agents.items() if v.get("session") == sid]:
             a = agents.pop(aid)
             notes.append(note_for(row, a["col"]))
+    if notes:
+        marked = set(state.get("blink") or [])
+        if marked & set(notes):
+            state["blink"] = sorted(marked - set(notes))
     return notes
 
 
@@ -548,8 +693,46 @@ def kill_stray_workers() -> None:
         pass
 
 
+def print_sessions() -> None:
+    """Print what the display currently thinks is going on. Mostly for checking
+    that owner-process tracking actually found your Claude Code processes: a chat
+    showing `owner=?` couldn't be tied to one, so its pad will hang around until
+    idle expiry instead of clearing the moment you close it."""
+    state = _norm(load_state())
+    if not state["sessions"]:
+        print("No chats tracked. The grid should be blank.")
+        return
+    marked = blink_notes(state)
+    print(f"{'chat':<40} {'pad':>4}  {'state':<14} owner")
+    for sid, row in sorted(state["sessions"].items(), key=lambda kv: kv[1]):
+        note = note_for(row, 0)
+        if note in marked:
+            label = "needs approval"
+        elif sid in state["idle_since"]:
+            label = "done"
+        else:
+            label = "working"
+        owner = state["owners"].get(sid)
+        if not owner:
+            where = "?  (falls back to idle expiry)"
+        else:
+            live = _started_at(int(owner["pid"])) == owner.get("started", "")
+            where = f"pid {owner['pid']} {'alive' if live else 'GONE -> clearing'}"
+        subs = sum(1 for a in state["agents"].values() if a.get("session") == sid)
+        print(f"{sid:<40} {note:>4}  {label:<14} {where}"
+              + (f"   (+{subs} subagent{'s' if subs != 1 else ''})" if subs else ""))
+
+
 # --- Main --------------------------------------------------------------------
 def main() -> None:
+    # Diagnostic: dump tracked chats and whether their processes are still alive.
+    if len(sys.argv) >= 2 and sys.argv[1] == "sessions":
+        try:
+            print_sessions()
+        except Exception as exc:
+            print(f"couldn't read state: {exc}")
+        sys.exit(0)
+
     # Long-running watch daemon: continuously reconciles the grid with state.
     if len(sys.argv) >= 2 and sys.argv[1] == "watch":
         try:
@@ -669,6 +852,9 @@ def watch_loop() -> None:
     loop stays quiet on the wire, re-reads the state file only every
     WATCH_STATE_POLL_S, forces a full repaint periodically, and blanks the grid
     while muted.
+    It also sweeps for dead chats: a chat whose owning Claude Code process has
+    exited is cleared here, which is how a pad goes out when you close a window
+    or tab rather than exiting cleanly.
     """
     try:
         import mido
@@ -684,6 +870,7 @@ def watch_loop() -> None:
         last_full = 0.0         # force an initial full paint
         state = None
         last_poll = 0.0
+        last_liveness = 0.0
         try:
             with mido.open_output(port_name) as out:
                 while True:
@@ -691,6 +878,13 @@ def watch_loop() -> None:
                     if now - last_full > WATCH_FULL_REPAINT_S:
                         painted.clear()  # heal any silent drift
                         last_full = now
+
+                    # Clear chats whose process is gone (window/tab closed, or
+                    # Claude Code crashed) -- the case no hook can catch.
+                    if WATCH_LIVENESS_S > 0 and now - last_liveness >= WATCH_LIVENESS_S:
+                        last_liveness = now
+                        if prune_dead_sessions():
+                            state = None  # state changed: re-read it below
 
                     muted = is_disabled()
                     if muted:           # muted for jamming: keep the grid dark
@@ -718,6 +912,10 @@ def _dispatch(event: str, payload: dict) -> None:
     # Any activity refreshes this chat's idle timer and expires stale chats
     # (whose close event Claude Code never delivered), blanking their pads.
     if event in _STATUS_EVENTS:
+        if event != "session_end":
+            # Remember the process behind this chat, so its pad clears even if
+            # the chat is later killed without firing session_end.
+            record_owner(sid)
         for note in touch_and_prune(sid, event):
             stop_blink(note)
             send_note(note, 0)
