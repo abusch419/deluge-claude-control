@@ -88,25 +88,33 @@ SESSION_TTL_S = _env_int("DELUGE_SESSION_TTL_S", 7200)  # 2 hours idle after fin
 # The grid is white-only: Midigrid renders incoming notes as white with velocity
 # as brightness, so state is carried by BRIGHTNESS + BLINK RATE, not colour.
 #
+#   working        -> bright, STEADY (no blink -- it needs nothing from you)
+#   done working   -> dim, SLOW blink (wants you back, but it can wait)
 #   needs approval -> bright, FAST blink (drops fully off, so it's unmissable)
-#   working        -> bright, SLOW blink (never dims below the idle level)
-#   stopped / idle -> dull, steady (no blink at all)
 #
-# Keep WORK_LOW_VELOCITY comfortably above IDLE_VELOCITY. That's what stops a
-# working pad caught mid-blink from reading as a stopped one.
-SOLID_VELOCITY = _env_int("DELUGE_SOLID_VELOCITY", 127)       # working: blink high
-WORK_LOW_VELOCITY = _env_int("DELUGE_WORK_LOW_VELOCITY", 60)  # working: blink low
-IDLE_VELOCITY = _env_int("DELUGE_IDLE_VELOCITY", 25)          # stopped: steady dull
-PERM_VELOCITY = _env_int("DELUGE_PERM_VELOCITY", 127)         # needs approval: blink high
-PERM_LOW_VELOCITY = _env_int("DELUGE_PERM_LOW_VELOCITY", 0)   # needs approval: blink low
+# Blinking is reserved for the two states that actually want your attention, and
+# the rate says how badly. A pad that's just working never moves.
+SOLID_VELOCITY = _env_int("DELUGE_SOLID_VELOCITY", 127)       # working: steady
+
+# Done working: blinks between these two. Keep both clearly below SOLID_VELOCITY
+# so a finished chat never competes with a working one, and keep the low end
+# visible -- if a done pad seems to vanish on your hardware, raise it.
+IDLE_HIGH_VELOCITY = _env_int("DELUGE_IDLE_HIGH_VELOCITY",
+                              _env_int("DELUGE_IDLE_VELOCITY", 60))
+IDLE_LOW_VELOCITY = _env_int("DELUGE_IDLE_LOW_VELOCITY", 15)
+
+# Needs approval: blinks between these two, dropping fully off at the low end.
+PERM_VELOCITY = _env_int("DELUGE_PERM_VELOCITY", 127)
+PERM_LOW_VELOCITY = _env_int("DELUGE_PERM_LOW_VELOCITY", 0)
 
 # Blink half-periods in seconds (time at the high level, then time at the low
-# level). The ~5x gap between them is the whole point: it's what makes "needs
-# you" unmistakable next to an ordinary working pad.
+# level). The ~5x gap between them is the whole point: it's what separates
+# "come back when you can" from "I'm stuck, come now".
 # DELUGE_BLINK_INTERVAL_S is honoured as the old name for the permission rate.
 PERM_BLINK_S = _env_float("DELUGE_PERM_BLINK_S",
                           _env_float("DELUGE_BLINK_INTERVAL_S", 0.18))
-WORK_BLINK_S = _env_float("DELUGE_WORK_BLINK_S", 0.9)
+IDLE_BLINK_S = _env_float("DELUGE_IDLE_BLINK_S",
+                          _env_float("DELUGE_WORK_BLINK_S", 0.9))
 
 # --- Watch daemon ------------------------------------------------------------
 # The `watch` service continuously repaints the grid from tracked state so the

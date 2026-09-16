@@ -14,10 +14,11 @@ status pad is the first pad in that row (column 0), and each subagent it spawns
   (Deluge grid is 16 wide, so the next row up starts 16 notes higher.)
 
 Visual language (the grid is white-only, so brightness + blink rate carry the
-state -- see config.py):
-  needs approval -> bright, FAST blink (127 <-> 0, ~0.18s)
-  working        -> bright, SLOW blink (127 <-> 60, ~0.9s)
-  stopped / idle -> dull, steady        (velocity 25, no blink)
+state -- see config.py). Blinking is reserved for the states that want your
+attention, and the rate says how badly:
+  working        -> bright, STEADY      (velocity 127, no blink)
+  done working   -> dim, SLOW blink     (60 <-> 15, ~0.9s)
+  needs approval -> bright, FAST blink  (127 <-> 0, ~0.18s)
   closed / off   -> off                 (velocity 0)
 
 The `watch` daemon is what animates the blinks: it repaints the grid from tracked
@@ -99,12 +100,12 @@ SESSION_TTL_S = config.SESSION_TTL_S
 
 # Brightness / blink rates
 SOLID_VELOCITY = config.SOLID_VELOCITY
-WORK_LOW_VELOCITY = config.WORK_LOW_VELOCITY
-IDLE_VELOCITY = config.IDLE_VELOCITY
+IDLE_HIGH_VELOCITY = config.IDLE_HIGH_VELOCITY
+IDLE_LOW_VELOCITY = config.IDLE_LOW_VELOCITY
 PERM_VELOCITY = config.PERM_VELOCITY
 PERM_LOW_VELOCITY = config.PERM_LOW_VELOCITY
 PERM_BLINK_S = config.PERM_BLINK_S
-WORK_BLINK_S = config.WORK_BLINK_S
+IDLE_BLINK_S = config.IDLE_BLINK_S
 WATCH_INTERVAL_S = config.WATCH_INTERVAL_S
 WATCH_STATE_POLL_S = config.WATCH_STATE_POLL_S
 WATCH_FULL_REPAINT_S = config.WATCH_FULL_REPAINT_S
@@ -489,9 +490,9 @@ def perm_velocity_at(now: float) -> int:
     return PERM_VELOCITY if _blink_high(now, PERM_BLINK_S) else PERM_LOW_VELOCITY
 
 
-def work_velocity_at(now: float) -> int:
-    """Working: bright, SLOW blink that never dims to the idle level."""
-    return SOLID_VELOCITY if _blink_high(now, WORK_BLINK_S) else WORK_LOW_VELOCITY
+def idle_velocity_at(now: float) -> int:
+    """Done working: dim, SLOW blink -- wants you back, but it isn't urgent."""
+    return IDLE_HIGH_VELOCITY if _blink_high(now, IDLE_BLINK_S) else IDLE_LOW_VELOCITY
 
 
 # --- Legacy cleanup ----------------------------------------------------------
@@ -600,26 +601,26 @@ _STATUS_EVENTS = {
 def _desired_grid(state: dict, now: float) -> dict:
     """Target velocity for every pad, a pure function of tracked state + clock:
 
+      working        -> steady SOLID_VELOCITY (bright, no blink)
+      done working   -> slow blink between IDLE_HIGH_VELOCITY and IDLE_LOW_VELOCITY
       needs approval -> fast blink between PERM_VELOCITY and PERM_LOW_VELOCITY
-      working        -> slow blink between SOLID_VELOCITY and WORK_LOW_VELOCITY
-      stopped / idle -> steady IDLE_VELOCITY (dull, no blink)
 
     A chat counts as working until it finishes a turn (which is what puts it in
     `idle_since`); subagents only exist in state while they're running, so their
-    pads always show the working blink. Notes not listed here are off (0).
-    Needing approval wins over working -- that's the one you have to act on.
+    pads are always solid. Notes not listed here are off (0). Needing approval
+    wins over everything -- that's the one you have to act on.
     """
     desired = {}
     sessions = state["sessions"]
     idle = state["idle_since"]
-    work_vel = work_velocity_at(now)
+    idle_vel = idle_velocity_at(now)
     perm_vel = perm_velocity_at(now)
     for sid, row in sessions.items():
-        desired[note_for(row, 0)] = IDLE_VELOCITY if sid in idle else work_vel
+        desired[note_for(row, 0)] = idle_vel if sid in idle else SOLID_VELOCITY
     for a in state["agents"].values():
         row = sessions.get(a.get("session"))
         if row is not None:
-            desired[note_for(row, a.get("col", 0))] = work_vel
+            desired[note_for(row, a.get("col", 0))] = SOLID_VELOCITY
     for note in blink_notes(state):
         desired[note] = perm_vel
     return desired
@@ -722,13 +723,14 @@ def _dispatch(event: str, payload: dict) -> None:
             send_note(note, 0)
 
     if event == "session_start":
-        # A new chat opened -> claim its row; its pad shows dim (idle, waiting).
+        # A new chat opened -> claim its row; it starts in the waiting-on-you
+        # state, so the daemon gives its pad the slow "done" blink.
         note = note_for(claim_session_row(sid), 0)
-        send_note(note, IDLE_VELOCITY)
+        send_note(note, IDLE_HIGH_VELOCITY)
 
     elif event == "working":
-        # Chat submitted a prompt -> working. Light it bright now; the watch
-        # daemon takes over and gives it the slow working blink.
+        # Chat submitted a prompt -> working: bright and steady, no blink. It
+        # wants nothing from you, so it shouldn't pull your eye.
         note = note_for(claim_session_row(sid), 0)
         stop_blink(note)
         send_note(note, SOLID_VELOCITY)
@@ -749,17 +751,18 @@ def _dispatch(event: str, payload: dict) -> None:
             note = claim_key_note(payload)
             send_note(note, SOLID_VELOCITY)
         elif is_blinking(note):
-            # Pad was fast-blinking for a permission prompt -> approved, so drop
-            # back to the working blink. Otherwise stay cheap: no MIDI here.
+            # Pad was fast-blinking for a permission prompt -> approved, so go
+            # back to steady working. Otherwise stay cheap: no MIDI here.
             stop_blink(note, final_velocity=SOLID_VELOCITY)
 
     elif event == "stop":
-        # Chat finished responding -> stop blinking and settle to steady dull.
-        # Keep the row; the pad stays visible (dull) until the chat closes.
+        # Chat finished responding -> drop out of the fast blink and hand the pad
+        # to the slow "done, come back" blink. Keep the row; the pad stays
+        # visible until the chat closes.
         note = peek_session_note(sid)
         if note is not None:
             stop_blink(note)
-            send_note(note, IDLE_VELOCITY)
+            send_note(note, IDLE_HIGH_VELOCITY)
 
     elif event == "session_end":
         # Chat closed -> free its row and all its subagents, blank their pads.

@@ -19,18 +19,19 @@ negligible latency.
 
 At a glance, a pad tells you what a chat is doing:
 
-| Pad appearance             | Meaning |
-| -------------------------- | ------- |
-| **Bright, fast blink**     | needs your approval (permission request) |
-| **Bright, slow blink**     | working |
-| **Dull, steady**           | stopped (turn finished, chat still open) |
-| **Off**                    | done / chat closed |
+| Pad appearance         | Meaning |
+| ---------------------- | ------- |
+| **Bright, steady**     | working |
+| **Dim, slow blink**    | done working (turn finished, chat still open) |
+| **Bright, fast blink** | needs your approval (permission request) |
+| **Off**                | chat closed |
 
 The grid is white-only, so brightness and blink rate carry the state instead of
-colour. The two blink rates are ~5x apart (0.18s vs 0.9s half-period), which is
-what makes "needs you" unmistakable next to an ordinary working pad; and a
-working pad never dims below the dull level, so it can't be misread as stopped
-mid-blink.
+colour. Blinking is reserved for the two states that want your attention, and
+the rate says how badly: a chat that's just working sits bright and still, a
+finished one blinks slowly to say come back when you can, and one waiting on
+approval blinks ~5x faster and drops fully off. Nothing else on the grid moves,
+so movement always means you.
 
 > The blinking is driven by the **watch daemon** (step 6), which repaints the
 > grid many times a second. Hooks alone still light pads bright or dull, but
@@ -112,14 +113,13 @@ name). The important ones:
 - `SESSION_TTL_S` — a chat's pad auto-clears once it has **finished a turn and
   then stayed idle** this many seconds (default 7200 = 2h; `0` disables it). See
   "Idle expiry" below.
-- `IDLE_VELOCITY` — brightness of a stopped/idle pad (default 25). This is the
-  floor of the whole language, so keep it clearly visible but well below
-  `WORK_LOW_VELOCITY`.
-- `SOLID_VELOCITY` / `WORK_LOW_VELOCITY` — the two levels a working pad blinks
-  between (default 127 / 60).
+- `SOLID_VELOCITY` — brightness of a working pad (default 127, steady).
+- `IDLE_HIGH_VELOCITY` / `IDLE_LOW_VELOCITY` — the two levels a done pad blinks
+  between (default 60 / 15). Keep both well below `SOLID_VELOCITY`, and raise the
+  low one if a finished chat seems to vanish on your hardware.
 - `PERM_VELOCITY` / `PERM_LOW_VELOCITY` — the two levels a needs-approval pad
   blinks between (default 127 / 0, so it drops fully off).
-- `WORK_BLINK_S` / `PERM_BLINK_S` — blink half-periods in seconds (default 0.9
+- `IDLE_BLINK_S` / `PERM_BLINK_S` — blink half-periods in seconds (default 0.9
   and 0.18). Keep them far apart or the two states stop being distinguishable.
 - `WATCH_INTERVAL_S` — how often the watch service reconciles the grid.
 
@@ -169,7 +169,7 @@ unplug, or a Mac sleep the grid would drift out of sync. The **watch daemon**
 fixes this: it continuously repaints the grid from tracked state and self-heals
 whenever the device reconnects. It is also what animates the blinks — each pad's
 brightness is a function of its state and the clock, so the daemon has to be
-running for working and needs-approval pads to pulse.
+running for the done and needs-approval blinks to happen.
 
 Run it once to try it:
 
@@ -223,13 +223,13 @@ hook JSON payload from stdin:
 
 | Event                | Fires when              | Effect                             |
 | -------------------- | ----------------------- | ---------------------------------- |
-| `session_start`      | chat opened             | claim a row; pad dim (idle)        |
-| `working`            | prompt submitted        | chat's pad slow-blinks (working)   |
+| `session_start`      | chat opened             | claim a row; pad slow-blinks       |
+| `working`            | prompt submitted        | chat's pad bright and steady       |
 | `permission_request` | Claude needs permission | that pad fast-blinks               |
-| `posttool`           | a tool finished         | approval cleared → back to working |
-| `stop`               | chat finished a turn    | steady dull (stopped); keeps row   |
+| `posttool`           | a tool finished         | approval cleared → steady working  |
+| `stop`               | chat finished a turn    | slow "done" blink; keeps the row   |
 | `session_end`        | chat closed             | free the row + its subagents, off  |
-| `subagent_start`     | subagent spawned        | next pad in its chat's row, working |
+| `subagent_start`     | subagent spawned        | next pad in its row, bright steady |
 | `subagent_stop`      | subagent finished       | pad off; free that pad             |
 | `disable` / `enable` | manual                  | mute / unmute                      |
 | `reset`              | manual                  | blank grid + wipe state            |
