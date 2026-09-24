@@ -754,6 +754,125 @@ def _desired_grid(state: dict) -> dict:
     return desired
 
 
+# --- Centcom sync --------------------------------------------------------------
+def _read_centcom():
+    """(collected_at, {session_id: status}) from a fresh, error-free Centcom
+    snapshot, or None when it's missing, stale, or unhealthy."""
+    try:
+        path = Path(config.CENTCOM_SNAPSHOT)
+        if path.stat().st_size > 2_000_000:
+            return None
+        with open(path) as f:  # reopen by name: Centcom replaces the file
+            data = json.load(f)
+        if data.get("version") != 1 or data.get("errors"):
+            return None
+        at = float(data["collected_at"])
+        if not (0 <= time.time() - at <= config.CENTCOM_MAX_AGE_S):
+            return None
+        return at, {str(x["session_id"]): x.get("status") for x in data["sessions"][:500]}
+    except Exception:
+        return None
+
+
+def _session_blinking_marked(state: dict, sid: str) -> bool:
+    """Like _session_is_blinking, but also counts a durable blink record whose
+    worker is momentarily dead, so the sync never touches a needs-you pad."""
+    row = state["sessions"].get(sid)
+    if row is None:
+        return False
+    marked = set(state["blink"])
+    notes = [note_for(row, 0)] + [note_for(row, a.get("col", 0))
+                                  for a in state["agents"].values()
+                                  if a.get("session") == sid]
+    return any(n in marked or is_blinking(n) for n in notes)
+
+
+def centcom_sync(mem: dict) -> None:
+    """Correct the hook-tracked state from Centcom's snapshot. Called by the
+    watch loop; `mem` is its in-memory scratch space across ticks.
+
+    Only fixes what hooks miss. Never changes a blinking chat's pad (unless the
+    chat is confirmed closed), never acts on a
+    chat within CENTCOM_GRACE_S of its last hook event, and needs
+    CENTCOM_CONFIRM_SCANS snapshots in a row to agree before changing anything.
+    """
+    snap = _read_centcom()
+    if snap is None or snap[0] == mem.get("at"):
+        return  # Centcom offline/stale, or nothing new since last tick
+    mem["at"], live = snap
+    need = max(1, config.CENTCOM_CONFIRM_SCANS)
+    votes = mem.setdefault("votes", {})     # (sid, verdict) -> consecutive count
+    seen_live = mem.setdefault("seen", set())   # sids Centcom has ever listed
+    suppressed = mem.setdefault("suppressed", set())  # closed by a hook/reset
+    prev_tracked = mem.get("tracked", set())
+    seen_live.update(live)
+
+    def vote(sid, verdict):
+        key = (sid, verdict)
+        votes[key] = votes.get(key, 0) + 1
+        return votes[key] >= need
+
+    to_blank = []
+    now = time.time()
+    with state_lock():
+        state = _norm(load_state())
+        sessions, idle, seen = state["sessions"], state["idle_since"], state["seen"]
+        tracked = set(sessions)
+        # A chat that a hook (session_end) or `reset` just removed must not be
+        # re-added while Centcom still lists it for a few more seconds.
+        suppressed |= prev_tracked - tracked
+        suppressed &= set(live)
+        changed = False
+        cast = set()
+
+        for sid in list(sessions):
+            if now - seen.get(sid, 0) < config.CENTCOM_GRACE_S:
+                continue
+            status = live.get(sid)
+            if status is None:
+                # Closed without SessionEnd. Only trust this for chats Centcom
+                # has listed before (it can't see every kind of chat). Applies
+                # even to a blinking chat: a closed chat can't need you.
+                if sid in seen_live and vote(sid, "gone"):
+                    to_blank.extend(_remove_session(state, sid))
+                    seen_live.discard(sid)
+                    changed = True
+                cast.add((sid, "gone"))
+            elif _session_blinking_marked(state, sid):
+                continue  # needs you: the hooks own this pad
+            elif status == "idle" and sid not in idle:
+                if vote(sid, "idle"):   # missed Stop: bright -> dim
+                    idle[sid] = now
+                    changed = True
+                cast.add((sid, "idle"))
+            elif status == "busy" and sid in idle:
+                if vote(sid, "busy"):   # missed prompt: dim -> bright
+                    idle.pop(sid, None)
+                    changed = True
+                cast.add((sid, "busy"))
+
+        for sid, status in live.items():
+            if sid in sessions or sid in suppressed:
+                continue
+            if vote(sid, "new"):        # open chat that never fired SessionStart
+                sessions[sid] = _first_free(set(sessions.values()), NUM_ROWS)
+                seen[sid] = now - config.CENTCOM_GRACE_S
+                if status != "busy":
+                    idle[sid] = now
+                changed = True
+            cast.add((sid, "new"))
+
+        # A verdict only counts if it holds on consecutive snapshots.
+        for key in list(votes):
+            if key not in cast:
+                del votes[key]
+        if changed:
+            save_state(state)
+        mem["tracked"] = set(sessions)
+    for note in to_blank:
+        stop_blink(note)
+
+
 def watch_loop() -> None:
     """Continuously reconcile the Deluge grid with tracked state.
 
@@ -769,9 +888,15 @@ def watch_loop() -> None:
     except Exception:
         return
     grid = list(range(BASE_NOTE, BASE_NOTE + NUM_ROWS * ROW_WIDTH))
+    sync_mem = {}  # Centcom sync scratch space, kept across reconnects
     while True:  # outer loop: (re)acquire the port forever
         port_name = find_deluge_port()
         if port_name is None:
+            if config.CENTCOM_SYNC:  # keep state correct while unplugged
+                try:
+                    centcom_sync(sync_mem)
+                except Exception:
+                    pass
             time.sleep(2.0)
             continue
         painted = {}            # note -> last velocity we sent (reset on reconnect)
@@ -784,6 +909,11 @@ def watch_loop() -> None:
                         painted.clear()  # heal any silent drift
                         last_full = now
 
+                    if config.CENTCOM_SYNC:
+                        try:
+                            centcom_sync(sync_mem)
+                        except Exception:
+                            pass  # sync is best-effort; never break painting
                     if is_disabled():   # muted for jamming: keep the grid dark
                         desired = {}
                     else:
