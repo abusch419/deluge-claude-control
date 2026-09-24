@@ -100,3 +100,22 @@ WATCH_INTERVAL_S = _env_float("DELUGE_WATCH_INTERVAL_S", 1.0)
 # Every this many seconds the watcher forces a full repaint (belt-and-suspenders
 # in case the device silently forgot its LEDs without dropping the USB port).
 WATCH_FULL_REPAINT_S = _env_float("DELUGE_WATCH_FULL_REPAINT_S", 20.0)
+
+# --- Centcom bridge (bridge.py) ----------------------------------------------
+# The bridge replaces the Claude Code hooks: it reads the session snapshot that
+# the Centcom dashboard's observer writes, and lights pads from that.
+CENTCOM_SNAPSHOT = _env_str(
+    "DELUGE_CENTCOM_SNAPSHOT",
+    os.path.expanduser("~/.centcom/state/host-sessions.json"))
+# A snapshot older than this (seconds) is treated as "observer offline": the
+# grid holds its last state instead of clearing.
+SNAPSHOT_MAX_AGE_S = _env_float("DELUGE_SNAPSHOT_MAX_AGE_S", 8.0)
+# Centcom reports "open" when a chat is open but its activity is unknown.
+# Shown dimmer than idle so you can tell them apart. Set equal to IDLE to merge.
+OPEN_VELOCITY = _env_int("DELUGE_OPEN_VELOCITY", 8)
+# A chat must be missing from this many healthy snapshots in a row before its
+# row is freed (guards against a one-scan glitch blanking a pad).
+ABSENT_SCANS_TO_FREE = _env_int("DELUGE_ABSENT_SCANS_TO_FREE", 2)
+# With no file events at all, the bridge still wakes this often (seconds) to
+# check whether the Deluge was plugged back in. It sleeps in between.
+BRIDGE_IDLE_WAKE_S = _env_float("DELUGE_BRIDGE_IDLE_WAKE_S", 15.0)

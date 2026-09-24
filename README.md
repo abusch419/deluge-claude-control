@@ -37,6 +37,37 @@ row 2:  [chat C] ...
 Each **chat** claims the next free **row**; its own pad is the first pad in that
 row. Each **subagent** the chat spawns lights the next pad to the right.
 
+## Option B: Centcom bridge (no hooks)
+
+If you run the Centcom dashboard, `bridge.py` can drive the Deluge instead of
+the hooks. It reads the session list Centcom's observer writes to
+`~/.centcom/state/host-sessions.json` and sleeps until that file changes
+(kqueue on macOS), so it uses near-zero CPU. It only sends MIDI for pads whose
+brightness changed.
+
+| Pad | Meaning |
+| --- | ------- |
+| Bright | working (`busy`) |
+| Dim | idle, chat still open |
+| Very dim | open, activity unknown |
+| Off | chat closed |
+
+Not available from Centcom, so not shown: permission blinking and subagent pads.
+
+Setup (macOS):
+
+1. Do step 1 below (the venv with `mido` and `python-rtmidi`).
+2. Remove the Deluge hooks from your Claude Code settings, and unload the old
+   watch service if you installed it:
+   `launchctl bootout gui/$(id -u)/com.deluge-claude.watch`
+3. Test once: `./.venv/bin/python3 bridge.py once`
+4. Copy `com.deluge-claude.bridge.plist.example` to
+   `~/Library/LaunchAgents/com.deluge-claude.bridge.plist`, fill in the paths,
+   then `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.deluge-claude.bridge.plist`
+
+Commands: `bridge.py mute`, `bridge.py unmute`, `bridge.py reset`.
+Settings are at the bottom of `config.py`.
+
 ---
 
 ## Setup
